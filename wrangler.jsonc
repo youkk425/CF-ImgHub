@@ -16,7 +16,7 @@
   // R2 已移除：图片字节只走 Telegram / HuggingFace，KV 只放小元数据，免费额度绰绰有余。
   // 首次部署前要建命名空间并填 id：npx wrangler kv namespace create META
   "kv_namespaces": [
-    { "binding": "META", "id": "{{KV_NAMESPACE_ID_ybq0xj}}" }
+    { "binding": "META", "id": "6d8f7bbe75214bf3af9fbcbd9d63df2b" }
   ],
 
   // 登录限速：每个 IP 每分钟 5 次（按机房计数，足以挡住暴力猜密码）
