@@ -5,7 +5,7 @@
 import { pickContentType } from './mime.js';
 import { hasRole, identify, login, logoutCookie, sameOrigin } from './auth.js';
 import { getSettings, saveSettings, publicSettings, normBgUrl, normLink, normName, normSite, normThemeColor, siteInfo, isFileKey, splitStorage, STORAGE_MODES, MAX_BG, MAX_DOMAINS, MAX_LINKS, MAX_SITES, THEME_MODES, BG_INTERVALS } from './settings.js';
-import { keyTime } from './stores.js';
+import { BRAND, keyTime } from './stores.js';
 import { tgDelete, tgPut, tgReady, tgStream } from './telegram.js';
 import {
   BACKUP_BATCH, HF_QUOTA, MAX_HF_BYTES, MAX_SWEEP_BYTES,
