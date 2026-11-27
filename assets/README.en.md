@@ -37,7 +37,7 @@ Storage mode is a three-way choice on the settings page (default `tg`):
 |------|------|-------|
 | `tg` (default) | Telegram channel | No object storage used; uncached reads take 0.5–3 s; up to 100 MB per file |
 | `tg+hf` | Telegram + HuggingFace | Primary on TG, with an archive copy on HF for disaster recovery; reads fall back to the archive |
-| `hf` (experimental) | HuggingFace bucket | Bytes only in HF; proxied by the Worker (≈16 reads/sec), 30 MB per file, uploads fail with `hf_quota` once the free 100 GB is full |
+| `hf` (experimental) | HuggingFace bucket | Bytes only in HF; proxied by the Worker (≈16 reads/sec), 30 MB per file; the app uses a 100 GiB soft threshold (`HF_QUOTA`) and fails uploads with `hf_quota` past it (HF's own billing follows its official terms) |
 
 > [!WARNING]
 > The HF side of `hf` / `tg+hf` is the capability upstream labels **experimental**: Worker-proxied reads, no edge direct links, less battle-tested than object storage. I only run it on a low-traffic personal blog with modest image sizes. **For production, large images, or high concurrency, use a solution with real object storage.** Full trade-off analysis: `docs/Huggingface-主存代价分析.md`, `docs/重构方案-移除R2.md`.
@@ -92,7 +92,7 @@ Five base secrets to fill in:
 
 ### Optional: add a HuggingFace backup (`tg+hf` or `hf`)
 
-1. HF → avatar → Settings → Storage Buckets, create a private bucket, e.g. `imghub-archive`
+1. HF → avatar → Settings → **Storage Buckets**, create a private bucket, e.g. `imghub-archive` (⚠️ it must be a **Storage Bucket**, not a Dataset — dataset repos can't be used for images over the S3 API)
 2. Settings → Access Tokens → create a write-scoped token (scoped to that bucket) → "Generate S3 credentials", note the `HFAK…` AK and the SK (the SK is shown only once)
 3. In the Worker's "Variables & Secrets", add:
 

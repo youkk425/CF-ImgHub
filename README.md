@@ -9,6 +9,8 @@
   跑在 Cloudflare Workers 上，但<b>彻底移除了 R2</b>——图片字节存 Telegram（默认）或 HuggingFace，元数据进 Workers KV。
 </p>
 
+> 因为没钱绑R2 😭😭😭
+
 > [!IMPORTANT]
 > **这是我的个人自用副本，不打算维护，也不接受功能请求。** 想用这个图床、看完整文档或提 Issue / PR，请去**原项目**：
 >
@@ -16,9 +18,6 @@
 >
 > 下面的内容只作为我自己部署时的备忘。我这份 Fork **把 R2 整个去掉了**（Cloudflare R2 开通要绑卡，我不想绑），改用 Telegram / HuggingFace 存字节 + Workers KV 存元数据。这是一次代码级重构，与上游的存储架构已经不同。
 
-<p align="center">
-  <a href="https://github.com/TG-Twilight/CF-ImgHub/fork"><img src="assets/fork.svg" alt="到原项目 Fork 并部署"></a>
-</p>
 
 ## 这个 Fork 的看点：彻底去掉 R2
 
@@ -33,7 +32,7 @@
 |------|------|------|
 | `tg`（默认） | Telegram 频道 | 不占对象存储；未缓存时首次打开慢 0.5–3 秒；单文件上限 100 MB |
 | `tg+hf` | Telegram + HuggingFace | 主存 TG，另归档一份到 HF 容灾；主存丢时可从归档读回 |
-| `hf`（实验） | HuggingFace bucket | 字节只进 HF；Worker 代读（HF 读上限约 16 次/秒），单文件上限 30 MB，免费 100 GB 满了上传报 `hf_quota` |
+| `hf`（实验） | HuggingFace bucket | 字节只进 HF；Worker 代读（HF 读上限约 16 次/秒），单文件上限 30 MB；应用内按 100 GB 软阈值（`HF_QUOTA`）判断，超了上传报 `hf_quota`（HF 平台自身计费以官方政策为准） |
 
 > [!WARNING]
 > `hf` / `tg+hf` 的 HF 部分是上游标注的**实验**能力：Worker 代读、无边缘直链、稳定性不如对象存储。我只在低流量、图不大的个人博客上用；**生产、大图、高并发请用回带对象存储的方案**。完整权衡见 `docs/Huggingface-主存代价分析.md`、`docs/重构方案-移除R2.md`。
@@ -87,7 +86,7 @@
 
 ### 可选：加 HuggingFace 备份（`tg+hf` 或 `hf`）
 
-1. HF → 头像 → Settings → Storage Buckets，建一个私有桶，例如 `imghub-archive`
+1. HF → 头像 → Settings → **Storage Buckets**，建一个私有桶，例如 `imghub-archive`（⚠️ 必须是 **Storage Bucket**，不是 Dataset —— 数据集仓库不能用 S3 接口存图）
 2. Settings → Access Tokens → 新建 write 级 token（勾选对应桶）→「Generate S3 credentials」，记下 `HFAK…` 和 SK（SK 只显示一次）
 3. 到 Worker 的「变量和机密」添加：
 

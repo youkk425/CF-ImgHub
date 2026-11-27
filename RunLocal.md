@@ -9,7 +9,7 @@
 | | 标准：`npm run dev`（wrangler + miniflare） | 零安装：`node scripts/dev-local.mjs` |
 |---|---|---|
 | 需要装依赖 | 需要（`npm install`，约 30 MB） | **不需要**，只用 Node 原生 API |
-| 运行时 | 真 workerd（与线上同一套语义） | 手写的够用子集（R2/Cache/Assets/Ratelimit 的内存实现） |
+| 运行时 | 真 workerd（与线上同一套语义） | 手写的够用子集（KV/Cache/Assets/Ratelimit 的内存实现） |
 | 数据 | 落盘在 `.wrangler/state`，重启还在 | 全在内存，**停止即清空** |
 | 定时任务、Durable Objects | 支持 | 不支持 |
 | 浏览器端压缩（AVIF/WebP） | `npm run vendor` 自动就绪 | 需要 `public/vendor/` 已存在（见 §8.2） |
@@ -55,7 +55,7 @@ cp .dev.vars.example .dev.vars      # Windows PowerShell: Copy-Item .dev.vars.ex
 npm run dev          # = npm run vendor && wrangler dev
 ```
 
-`vendor` 这一步把 `node_modules` 里的 AVIF/WebP 编码器和 mediabunny 复制到 `public/vendor/`（该目录是生成物，不提交）。首次启动 wrangler 会创建本地 R2 模拟环境。
+`vendor` 这一步把 `node_modules` 里的 AVIF/WebP 编码器和 mediabunny 复制到 `public/vendor/`（该目录是生成物，不提交）。首次启动 wrangler 会按 `wrangler.jsonc` 的 `kv_namespaces` 创建本地 KV 模拟环境。
 
 打开 <http://localhost:8787>：
 
@@ -75,7 +75,7 @@ npm run dev          # = npm run vendor && wrangler dev
 
 ### 2.4 本地数据在哪
 
-- 上传的图片、设置、缩略图：`.wrangler/state/v3/r2/`（删掉这个目录 = 恢复出厂）
+- 图片字节：存在 Telegram 频道 / HuggingFace bucket（**外部**，不在本地 `.wrangler` 里）；设置、图片清单、缩略图：`.wrangler/state/v3/kv/`（删掉这个目录 = 恢复出厂）
 - 想换位置：`npx wrangler dev --persist-to ./tmp-state`
 - 清空缓存表现：直接删对应目录后重启
 
@@ -90,13 +90,13 @@ npx wrangler tail           # 看线上日志（observability 已开）
 
 ## 3. 零安装路径：`node scripts/dev-local.mjs`
 
-机器上不装任何依赖时用它。脚本自己实现了一份够用的 R2 / Cache API / Assets / 登录限速，再加载真正的 `src/index.js`。
+机器上不装任何依赖时用它。脚本自己实现了一份够用的 Workers KV / Cache API / Assets / 登录限速，再加载真正的 `src/index.js`。
 
 ### 3.1 启动
 
 ```bash
-node scripts/dev-local.mjs                  # 端口 8787，只存 R2
-node scripts/dev-local.mjs --hf             # 额外起一个假 HuggingFace 网关（8788），可试 HF 归档/实验主存
+node scripts/dev-local.mjs                  # 端口 8787，默认 tg 存储（本地无假 TG，需真 TG 密钥才能传图）
+node scripts/dev-local.mjs --hf             # 额外起一个假 HuggingFace 网关（8788），不配 TG 也能传图并试 HF 归档/实验主存
 node scripts/dev-local.mjs --port 8790      # 换端口
 ```
 
@@ -120,9 +120,9 @@ node scripts/dev-local.mjs --port 8790      # 换端口
 
 | 能 | 不能 |
 |---|---|
-| 上传/读图/Range/304、管理页、设置页、R2 多桶路由、登录限速 | 定时任务（cron 补归档不会自己跑，可手动点「开始归档」） |
-| HF 归档与「实验：仅 HuggingFace」（配 `--hf`） | 真实投递到 Telegram/HF（除非 `.dev.vars` 里配了真密钥；假网关不校验签名） |
-| 与线上一致的 `src/` 代码路径 | 数据持久化：**停止进程即清空** |
+| 上传/读图/Range/304、管理页、设置页、KV 元数据、登录限速；HF 存储（配 `--hf`） | 定时任务（cron 补归档不会自己跑，可手动点「开始归档」） |
+| 真实 Telegram（配真 `TG_*` 密钥）与真实 HF 投递 | 假网关不校验 SigV4 签名（正确性靠 `hf-s3-smoke.mjs`，§7） |
+| 与线上一致的 `src/` 代码路径 | 数据持久化：**停止进程即清空**（真实 TG/HF 里的字节除外） |
 
 注意：假网关只验证线路（PUT/GET/HEAD/DELETE/ListObjectsV2/Range），**不校验 SigV4 签名**。签名的正确性由 `scripts/hf-s3-smoke.mjs` 单独保证（§7）。
 
@@ -169,7 +169,7 @@ curl -s -b cj.txt localhost:8787/api/stats
 curl -s -b cj.txt localhost:8787/api/hf/status        # ready=false 表示 HF 没配
 ```
 
-值得常跑的反向用例：`GET /file/.imghub/settings.json` → 404；未登录 `/api/list` → 401；第六次登录 → 429；不带 `Content-Length` 的上传 → 411；`storage` 选未配置的盘 → 400 `tg_not_configured` / `hf_not_configured`。
+值得常跑的反向用例：`GET /file/<点号开头的 key>` → 404（`/file/*` 拒绝 `.` 前缀，内部 KV key 不会外泄）；未登录 `/api/list` → 401；第六次登录 → 429；不带 `Content-Length` 的上传 → 411；`storage` 选未配置的盘 → 400 `tg_not_configured` / `hf_not_configured`。
 
 ---
 
@@ -197,7 +197,7 @@ HF_BUCKET=imghub-archive
 # 可选：HF_PREFIX=images、HF_ENDPOINT=https://<namespace>.s3.hf.co
 ```
 
-4. 重启 → `node scripts/hf-s3-smoke.mjs --live` 验协议（见 §7）→ 设置页选「R2 + HuggingFace 归档」或「实验：仅 HuggingFace」→ 点「开始归档」。
+4. 重启 → `node scripts/hf-s3-smoke.mjs --live` 验协议（见 §7）→ 设置页选「Telegram + HuggingFace 归档」（`tg+hf`）或「实验：仅 HuggingFace」（`hf`）→ 点「开始归档」。
 
 ### 6.3 状态与错误码
 
@@ -267,7 +267,7 @@ node scripts/hf-s3-smoke.mjs --live --keep   # 保留测试对象，方便去 HF
 2. **HF 相关改动**：`node scripts/hf-s3-smoke.mjs`（离线向量）→ 有凭证再 `--live`。
 3. **接口**：§5 的 curl 清单，含反向用例。
 4. **UI**：真浏览器点一遍 —— 上传（压缩开/关）、`/admin` 列表/详情/删除、`/settings` 各面板。
-5. **负路径**（改到这些区域时必跑）：`GET /file/.imghub/settings.json` → 404；跨域 Cookie `POST /api/delete` → 403 `bad_origin`；未登录 `/api/list` → 401；upload 角色删 24 小时前的图 → 403 `forbidden`；一分钟内第 6 次登录 → 429；无正文上传 → 411；`tg` 模式下用错 token → 502 `tg_failed`；`hf` 模式配额满 → 507 `hf_quota`。删除后 `/file/<key>` 必须几秒内全局 404（`gone` 名单）。
+5. **负路径**（改到这些区域时必跑）：`GET /file/<点号开头的 key>` → 404；跨域 Cookie `POST /api/delete` → 403 `bad_origin`；未登录 `/api/list` → 401；upload 角色删 24 小时前的图 → 403 `forbidden`；一分钟内第 6 次登录 → 429；无正文上传 → 411；`tg` 模式下用错 token → 502 `tg_failed`；`hf` 模式配额满 → 507 `hf_quota`。删除后 `/file/<key>` 必须几秒内全局 404（`gone` 名单）。
 
 ---
 
@@ -277,6 +277,6 @@ node scripts/hf-s3-smoke.mjs --live --keep   # 保留测试对象，方便去 HF
 |---|---|---|
 | `.dev.vars` | 否（gitignore） | 本地密钥；从 `.dev.vars.example` 复制 |
 | `public/vendor/` | 否（gitignore） | `npm run vendor` 生成的编码器 |
-| `.wrangler/state/` | 否 | wrangler 的本地 R2/Cache 数据 |
+| `.wrangler/state/` | 否 | wrangler 的本地 KV/Cache 数据（字节不在这里，在 TG/HF） |
 | `scripts/dev-local.mjs` | 是 | 零安装预览运行时 |
 | `scripts/hf-s3-smoke.mjs` | 是 | HF 签名与协议冒烟 |

@@ -37,7 +37,7 @@
 |------|------|------|
 | `tg`（預設） | Telegram 頻道 | 不佔物件儲存；未快取時首次開啟慢 0.5–3 秒；單一檔案上限 100 MB |
 | `tg+hf` | Telegram + HuggingFace | 主存 TG，另歸檔一份到 HF 容災；主存丟時可從歸檔讀回 |
-| `hf`（實驗） | HuggingFace bucket | 位元組只進 HF；Worker 代讀（HF 讀上限約 16 次／秒），單一檔案上限 30 MB，免費 100 GB 滿了上傳報 `hf_quota` |
+| `hf`（實驗） | HuggingFace bucket | 位元組只進 HF；Worker 代讀（HF 讀上限約 16 次／秒），單一檔案上限 30 MB；應用內按 100 GB 軟閾值（`HF_QUOTA`）判斷，超了上傳報 `hf_quota`（HF 平台自身計費以官方政策為準） |
 
 > [!WARNING]
 > `hf` / `tg+hf` 的 HF 部分是上游標註的**實驗**能力：Worker 代讀、無邊緣直鏈、穩定性不如物件儲存。我只在低流量、圖不大的個人部落格上用；**生產、大圖、高併發請用回帶物件儲存的方案**。完整權衡見 `../docs/Huggingface-主存代價分析.md`、`../docs/重構方案-移除R2.md`。
@@ -92,7 +92,7 @@
 
 ### 可選：加 HuggingFace 備份（`tg+hf` 或 `hf`）
 
-1. HF → 頭像 → Settings → Storage Buckets，建一個私有桶，例如 `imghub-archive`
+1. HF → 頭像 → Settings → **Storage Buckets**，建一個私有桶，例如 `imghub-archive`（⚠️ 必須是 **Storage Bucket**，不是 Dataset —— 資料集倉庫不能用 S3 介面存圖）
 2. Settings → Access Tokens → 建一個 write 級 token（勾選對應桶）→「Generate S3 credentials」，記下 `HFAK…` 和 SK（SK 只顯示一次）
 3. 到 Worker 的「變數和機密」新增：
 
