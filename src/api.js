@@ -7,6 +7,7 @@ import { hasRole, identify, login, logoutCookie, sameOrigin } from './auth.js';
 import { getSettings, saveSettings, publicSettings, normBgUrl, normLink, normName, normSite, normThemeColor, siteInfo, isFileKey, splitStorage, STORAGE_MODES, MAX_BG, MAX_DOMAINS, MAX_LINKS, MAX_SITES, THEME_MODES, BG_INTERVALS } from './settings.js';
 import { BRAND, keyTime } from './stores.js';
 import { tgDelete, tgPut, tgReady, tgStream } from './telegram.js';
+import { getManifest, putManifest, deleteManifest, getThumb, putThumb, deleteThumb, enqueueHf, dequeueHf, listHfQueue, listManifests } from './meta.js';
 import {
   BACKUP_BATCH, HF_QUOTA, MAX_HF_BYTES, MAX_SWEEP_BYTES,
   hfDelete, hfGet, hfPut, hfQuotaBlocked, hfReady, hfUsage,
@@ -182,7 +183,7 @@ export async function handleApi(request, env, ctx, url) {
       return json({ error: 'bad_key' }, 400);
     }
     if (!hfReady(env)) return json({ error: 'hf_not_configured' }, 400);
-    const results = await Promise.all(keys.map((k) => hfBackupKey(env, k).catch((err) => 'error')));
+    const results = await Promise.all(keys.map((k) => backupHfKey(env, k).catch((err) => 'error')));
     return json({ results });
   }
 
