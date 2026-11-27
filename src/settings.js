@@ -4,7 +4,9 @@
 // 防盗链语义：hotlink=true 时全局开启；allow 是后台填的放行网站（含子域）；exempt 里的 key 单独放行（单张开关）。
 // domains：本图床绑定的其他域名（只认完整主机名）。上传页/管理页可选用哪个域名生成链接，防盗链也把它们当作自身。
 // rss：是否放行内建的网页版 RSS 阅读器名单（默认开）。
-// storage：新上传存到哪里：r2（默认）/ r2+tg（R2 + Telegram 备份）/ tg（只存 Telegram）；没设 TG_BOT_TOKEN、TG_CHAT_ID 时一律按 r2。
+// storage：新上传存到哪里。第一段是主存（r2 | tg），其余是备份盘（tg | hf），例如 'r2+tg+hf'。
+//   可选值见 STORAGE_MODES；没配 TG_BOT_TOKEN/TG_CHAT_ID 或 HF_* 密钥时，未就绪的那一段会被自动去掉（见 api.js 的 storagePlan）。
+//   只存 HF（primary=hf）暂不提供：bucket 不存 customMetadata、不支持条件请求，而设置与缩略图离不开 R2。
 // bg：登录页 / 上传页背景，urls 是图片地址（https 完整地址或本站 /file/… 路径，最多 5 个，多于 1 个时轮播），interval 为轮播秒数。
 // 旧版存的是 keys（本图床的 key），读取时自动转成 /file/<key>。
 // theme：{color, mode, logo, glow}。glow：各页（含登录页）的撞色渐层背景，默认 true。logo=true 时 Logo 与站名改用主题色（默认 false = 枫橙 Logo）。color 是预设名（见 THEME_COLORS，配色在前端 theme.js 生成）或 #rrggbb 自定义种子色；
@@ -36,7 +38,14 @@ const DEFAULTS = {
 export const THEME_COLORS = ['maple', 'sakura', 'amber', 'bamboo', 'teal', 'ocean', 'violet', 'ink'];
 export const THEME_MODES = ['auto', 'light', 'dark'];
 export const normThemeColor = (c) => (THEME_COLORS.includes(c) ? c : typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c) ? c.toLowerCase() : null);
-export const STORAGE_MODES = ['r2', 'r2+tg', 'tg'];
+// 主存在前、备份盘在后；'hf' 是实验主存（字节只进 bucket，R2 只留清单/缩略图），默认不选
+export const STORAGE_MODES = ['r2', 'r2+tg', 'tg', 'r2+hf', 'tg+hf', 'r2+tg+hf', 'hf'];
+
+// 'r2+tg+hf' → { primary: 'r2', backups: ['tg', 'hf'] }；单写 'tg' 时主存就是 tg、没有备份盘
+export function splitStorage(mode) {
+  const [primary = 'r2', ...backups] = String(mode || 'r2').split('+');
+  return { primary, backups };
+}
 export const MAX_SITES = 200;
 export const MAX_DOMAINS = 20;
 export const MAX_BG = 5;

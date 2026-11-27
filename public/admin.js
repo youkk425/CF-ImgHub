@@ -12,6 +12,7 @@ let query = '';
 const selected = new Set();
 let current = null;
 let thumbs = new Set(); // 已有缩略图的 key
+let archived = new Set(); // 已归档到 HuggingFace 的 key（与 thumbs 同样从 /api/list 内部前缀页拼出）
 const SMALL = 1024 * 1024; // 没有缩略图时，这么小的原图直接拿来显示
 // 浏览器解不了、补不出缩略图的类型
 const NO_THUMB = /^image\/(heic|heif|tiff|jxl|svg)/i;
@@ -96,6 +97,7 @@ async function load() {
     }
     all.push(...r.body.items);
     for (const k of r.body.thumbs ?? []) thumbs.add(k);
+    for (const k of r.body.archived ?? []) archived.add(k);
     cursor = r.body.cursor;
   } while (cursor);
   all.sort((a, b) => timeOf(b) - timeOf(a));
@@ -307,7 +309,7 @@ function openDetail(o) {
   $('[data-f=type]', dlg).textContent = o.contentType || '—';
   $('[data-f=size]', dlg).textContent = `${size(o.size)} (${o.size.toLocaleString()} B)`;
   $('[data-f=uploaded]', dlg).textContent = when(timeOf(o));
-  $('[data-f=store]', dlg).textContent = o.tg ? 'Telegram' : 'R2';
+  $('[data-f=store]', dlg).textContent = o.tg ? 'Telegram' : o.hf ? 'HuggingFace' : archived.has(o.key) ? 'R2 + HF' : 'R2';
   $('[data-f=key]', dlg).textContent = o.key;
   $('[data-f=name]', dlg).textContent = o.name || '';
   for (const el of dlg.querySelectorAll('.orig')) el.hidden = !o.name;

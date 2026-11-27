@@ -2,10 +2,14 @@
 // 错误只返回代码（error 字段），由前端按语言翻译
 import { pickContentType } from './mime.js';
 import { allStores, BRAND, configStore, keyTime, storesFor, writeStore } from './stores.js';
-import { BG_INTERVALS, isFileKey, MAX_BG, MAX_DOMAINS, MAX_LINKS, MAX_SITES, STORAGE_MODES, THEME_MODES, getSettings, normThemeColor, normBgUrl, normLink, normName, normSite, publicSettings, saveSettings, siteInfo } from './settings.js';
+import { BG_INTERVALS, STORAGE_MODES, THEME_MODES, isFileKey, MAX_BG, MAX_DOMAINS, MAX_LINKS, MAX_SITES, getSettings, normBgUrl, normLink, normName, normSite, normThemeColor, publicSettings, saveSettings, siteInfo, splitStorage } from './settings.js';
 import { RSS_READERS } from './serve.js';
 import { hasRole, identify, login, logoutCookie, sameOrigin } from './auth.js';
-import { SIDECAR, TgError, isStub, realSize, tgDelete, tgPut, tgReady } from './telegram.js';
+import { SIDECAR, TgError, isPlaceholder, isStub, realSize, tgDelete, tgPut, tgReady } from './telegram.js';
+import {
+  BACKUP_BATCH, HF_QUOTA, MAX_HF_BYTES, MAX_SWEEP_BYTES, QUEUE as HF_QUEUE, SIDECAR as HF_SIDECAR,
+  hfDelete, hfPut, hfQuotaBlocked, hfReady, hfUsage, isHfStub,
+} from './huggingface.js';
 
 // 只对 Bearer 调用开放跨域；Cookie 会话是 SameSite=Strict，跨域请求本来就带不上
 const CORS = {
@@ -87,7 +91,10 @@ export async function handleApi(request, env, ctx, url) {
     }
     if ('storage' in (body ?? {})) {
       if (!STORAGE_MODES.includes(body.storage)) return json({ error: 'bad_request' }, 400);
-      if (body.storage !== 'r2' && !tgReady(env)) return json({ error: 'tg_not_configured' }, 400);
+      // 逐段校验：选了没配密钥的盘就报错，别悄悄降级——用户以为有备份其实没有
+      const tokens = splitStorage(body.storage);
+      if ((tokens.primary === 'tg' || tokens.backups.includes('tg')) && !tgReady(env)) return json({ error: 'tg_not_configured' }, 400);
+      if ((tokens.primary === 'hf' || tokens.backups.includes('hf')) && !hfReady(env)) return json({ error: 'hf_not_configured' }, 400);
       next.storage = body.storage;
     }
     if ('allow' in (body ?? {})) {
@@ -190,14 +197,153 @@ export async function handleApi(request, env, ctx, url) {
     }
     return json({ results });
   }
+  if (path === '/api/hf/status' && method === 'GET') return hfStatus(env);
+  // POST /api/hf/backup {keys}：把已在 R2、但还没归档的文件补备份到 HuggingFace（一次最多 BACKUP_BATCH 个）
+  if (path === '/api/hf/backup' && method === 'POST') {
+    if (!hfReady(env)) return json({ error: 'hf_not_configured' }, 400);
+    const body = await request.json().catch(() => null);
+    const keys = Array.isArray(body?.keys) ? body.keys.filter((k) => typeof k === 'string' && k && !k.startsWith('.')) : [];
+    if (!keys.length || keys.length > BACKUP_BATCH) return json({ error: 'bad_key' }, 400);
+    const results = [];
+    for (const key of keys) {
+      try {
+        results.push({ key, status: await hfBackupKey(env, key) });
+      } catch (err) {
+        console.warn(JSON.stringify({ event: 'hf-backup-failed', key, error: err.message }));
+        // 撞上限流就停下，剩下的交给下一轮或 cron；这张图留 .hfq/ 标记
+        if (err.retryAfter) return json({ results, retryAfter: err.retryAfter });
+        await hfQueue(env, key, null, 'error').catch(() => {});
+        results.push({ key, status: 'failed' });
+      }
+    }
+    return json({ results });
+  }
   return json({ error: 'not_found' }, 404);
 }
 
-const settingsOut = (env, s) => ({ ...publicSettings(s), rssReaders: RSS_READERS, tgReady: tgReady(env) });
+const settingsOut = (env, s) => ({ ...publicSettings(s), rssReaders: RSS_READERS, tgReady: tgReady(env), hfReady: hfReady(env) });
 
-// 实际使用的存储方式：没配置 Telegram 时一律只存 R2
-async function storageMode(env) {
-  return tgReady(env) ? (await getSettings(env)).storage : 'r2';
+// 把 storage 拆成「主存 + 备份盘」。主存可以是 r2 / tg / hf（hf 是实验值），没配密钥的那一段自动去掉。
+// 只是"降级路径"要一致：主存不可用就落回 r2，绝不把字节放到读不出来的地方。
+async function storagePlan(env) {
+  const { primary, backups } = splitStorage((await getSettings(env)).storage);
+  const ready = (t) => (t === 'tg' ? tgReady(env) : t === 'hf' ? hfReady(env) : true);
+  const head = ready(primary) ? primary : 'r2';
+  const rest = backups.filter(ready).filter((t) => t !== head && t !== 'r2');
+  return { primary: head, backups: rest };
+}
+
+// 待处理标记 .hfq/<key>：上传时太大、超配额或失败的文件留在这儿，由「补备份」按钮 / cron 收尾。
+// 标记对象就是 key 的纯函数，重复写无害，删掉才算处理完。
+async function hfQueue(env, key, size, reason) {
+  await configStore(env).bucket.put(
+    HF_QUEUE + key,
+    JSON.stringify({ v: 1, key, size: size ?? null, reason, at: Date.now() }),
+    { httpMetadata: { contentType: 'application/json' } },
+  );
+}
+
+// 把 R2 里的 key 备份到 HuggingFace：整份流式 PUT 进桶，清单连同原对象的 httpMetadata 存到主桶 .hf/<key>
+// 返回 done / exists（已归档）/ stub（只存 Telegram 的文件，字节不在 R2，留给 tg→hf 的路子）/
+//      skipped（超单文件上限或配额满，写 .hfq/ 标记）/ missing
+// maxBytes 是熔断上限：上传请求里用 MAX_HF_BYTES（waitUntil 只有 30 秒），cron 用 MAX_SWEEP_BYTES。
+async function hfBackupKey(env, key, maxBytes = MAX_HF_BYTES) {
+  const main = configStore(env).bucket;
+  // 已归档 / 只存 Telegram / 正主没了：都不需要再补备份，顺手清掉可能残留的标记，免得 cron 每轮空转
+  if (await main.head(HF_SIDECAR + key)) {
+    await main.delete(HF_QUEUE + key);
+    return 'exists';
+  }
+  for (const s of storesFor(env, key)) {
+    const head = await s.bucket.head(key);
+    if (!head) continue;
+    if (isPlaceholder(head)) {
+      await main.delete(HF_QUEUE + key);
+      return 'stub';
+    }
+    if (head.size > maxBytes || (await hfQuotaBlocked(env))) {
+      await hfQueue(env, key, head.size, head.size > maxBytes ? 'too_large' : 'quota');
+      return 'skipped';
+    }
+    const obj = await s.bucket.get(key);
+    if (!obj) return 'missing';
+    const manifest = await hfPut(env, key, obj.body, obj.size, obj.httpMetadata?.contentType);
+    await main.put(HF_SIDECAR + key, JSON.stringify(manifest), { httpMetadata: obj.httpMetadata });
+    await main.delete(HF_QUEUE + key);
+    return 'done';
+  }
+  await main.delete(HF_QUEUE + key);
+  return 'missing';
+}
+
+// GET /api/hf/status：归档用量 + 待归档的 key（设置页「补备份」按钮用）。
+// files/bytes 来自 ListObjectsV2（最多扫 5 页，扫不完标 partial）；bucket 没有用量接口，只能自己数。
+async function hfStatus(env) {
+  if (!hfReady(env)) return json({ ready: false });
+  const main = configStore(env).bucket;
+  const backed = new Set();
+  await listAll(main, { prefix: HF_SIDECAR }, (o) => backed.add(o.key.slice(HF_SIDECAR.length)));
+  const pending = [];
+  let queued = 0;
+  let tgOnly = 0;
+  let hfOnly = 0;
+  await listAll(main, { prefix: HF_QUEUE }, (o) => {
+    if (!backed.has(o.key.slice(HF_QUEUE.length))) queued++;
+  });
+  for (const s of allStores(env)) {
+    await listAll(s.bucket, { include: ['customMetadata'] }, (o) => {
+      if (o.key.startsWith('.')) return;
+      if (isStub(o)) tgOnly++;
+      else if (isHfStub(o)) hfOnly++; // 实验主存：字节只在 bucket，本来就不该出现在"待归档"里
+      else if (!backed.has(o.key) && pending.length < 200) pending.push(o.key);
+    });
+  }
+  let use = null;
+  let error = null;
+  try {
+    use = await hfUsage(env, { fresh: true }); // 状态卡是人工看用量，绕开 6 小时缓存
+  } catch (err) {
+    error = err.message; // 只带错误摘要，不含密钥与响应头
+  }
+  return json({
+    ready: true,
+    storage: (await getSettings(env)).storage,
+    bucket: env.HF_BUCKET,
+    prefix: env.HF_PREFIX || 'images',
+    backed: backed.size,
+    tgOnly,
+    hfOnly,
+    queued,
+    pending,
+    files: use?.files ?? 0,
+    bytes: use?.bytes ?? 0,
+    partial: Boolean(use?.partial),
+    quota: HF_QUOTA,
+    quotaPct: use ? Math.min(100, Math.round((use.bytes / HF_QUOTA) * 1000) / 10) : 0,
+    error,
+  });
+}
+
+// Cron：把 .hfq/ 里的标记逐个补一遍，成功就删标记。放宽到 MAX_SWEEP_BYTES（cron 单次上限 15 分钟，不是 30 秒）。
+// 桶满了或撞限流就停下，剩下的下一轮再来；重复跑无害。
+export async function hfSweep(env, limit = 100) {
+  if (!hfReady(env)) return { done: 0, left: 0 };
+  const main = configStore(env).bucket;
+  const keys = [];
+  await listAll(main, { prefix: HF_QUEUE }, (o) => keys.push(o.key.slice(HF_QUEUE.length)));
+  let done = 0;
+  let stopped = false;
+  for (const key of keys.slice(0, limit)) {
+    try {
+      await hfBackupKey(env, key, MAX_SWEEP_BYTES);
+      done++;
+    } catch (err) {
+      console.warn(JSON.stringify({ event: 'hf-sweep-failed', key, error: err.message }));
+      stopped = Boolean(err.retryAfter) || err.status === 403; // 限流或权限问题：整轮到此为止，别把外呼预算烧光
+      if (stopped) break;
+    }
+  }
+  return { done, left: keys.length - (stopped ? 0 : Math.min(keys.length, limit)) };
 }
 
 // 把 R2 里的 key 备份到 Telegram：清单连同原对象的 httpMetadata 存到主桶 .tg/<key>
@@ -272,9 +418,9 @@ async function upload(request, env, ctx, url) {
   const fileName = original ? name : key;
   const httpMetadata = { contentType, contentDisposition: `inline; filename*=UTF-8''${encodeURIComponent(fileName)}` };
   const custom = original ? {} : { name };
-  const mode = await storageMode(env);
+  const plan = await storagePlan(env);
   let size;
-  if (mode === 'tg') {
+  if (plan.primary === 'tg') {
     // 只存 Telegram：文件流式发到频道，R2 里放占位对象（正文是清单）
     let manifest;
     try {
@@ -285,17 +431,44 @@ async function upload(request, env, ctx, url) {
     }
     await store.bucket.put(key, JSON.stringify(manifest), { httpMetadata, customMetadata: { ...custom, tg: '1', size: String(length) } });
     size = length;
+    // 占位对象没有正文字节，HF 备份只能跳过（清单已经在 R2，tg 掉数据时读路径仍能取回）
+  } else if (plan.primary === 'hf') {
+    // 实验：只存 HuggingFace。字节直接流进 bucket，R2 只留清单占位对象 + 缩略图，几乎不占 R2 存储。
+    // 代价是读必须 Worker 代读（bucket 要签名、不能公开直链），且受 HF 读速率与 100 GB 免费额度约束。
+    if (await hfQuotaBlocked(env)) return json({ error: 'hf_quota' }, 507);
+    let manifest;
+    try {
+      manifest = await hfPut(env, key, request.body, length, contentType);
+    } catch (err) {
+      console.warn(JSON.stringify({ event: 'hf-upload-failed', key, error: err.message }));
+      return json({ error: err.status === 507 ? 'hf_quota' : 'hf_failed' }, 502);
+    }
+    // 占位对象正文是清单：读路径（serve.js 的 fromStore）据此知道字节在 bucket 里；
+    // customMetadata 里同样带 name/size，管理页、统计、删除都不用特殊照顾。
+    await store.bucket.put(key, JSON.stringify(manifest), { httpMetadata, customMetadata: { ...custom, stub: 'hf', size: String(length) } });
+    // 侧车清单与「备份」模式同一形状：hfStatus 的待归档统计、删除联动、兜底读都复用它
+    await configStore(env).bucket.put(HF_SIDECAR + key, JSON.stringify(manifest), { httpMetadata });
+    size = length;
   } else {
     const obj = await store.bucket.put(key, request.body, { httpMetadata, customMetadata: original ? undefined : custom });
     size = obj.size;
     // 备份在回应之后做，不拖慢上传；失败的可以在设置页补备份
-    if (mode === 'r2+tg') {
+    if (plan.backups.includes('tg')) {
       ctx.waitUntil(backupKey(env, key).catch((err) => console.warn(JSON.stringify({ event: 'tg-backup-failed', key, error: err.message }))));
+    }
+    if (plan.backups.includes('hf')) {
+      // 归档失败绝不影响上传：留 .hfq/ 标记，设置页「补备份」或 cron 再收
+      ctx.waitUntil(
+        hfBackupKey(env, key).catch(async (err) => {
+          console.warn(JSON.stringify({ event: 'hf-backup-failed', key, error: err.message }));
+          await hfQueue(env, key, length, 'error').catch(() => {});
+        }),
+      );
     }
   }
 
   // 从哪个域名进来就用哪个域名；要换成其他绑定域名由前端改写（见 ui.js 的 linkOf）
-  return json({ key, url: `${url.origin}/file/${encodeURIComponent(key)}`, size, contentType, store: mode === 'tg' ? 'tg' : store.binding });
+  return json({ key, url: `${url.origin}/file/${encodeURIComponent(key)}`, size, contentType, store: plan.primary === 'r2' ? store.binding : plan.primary });
 }
 
 // 规范名：ImgHub-YYYYMMDD-HHmmss-xxxx.ext，时间按 UTC+8；随机码用去掉 0/o/1/l 的 32 个字符，防同秒冲突、也防按时间猜链接
@@ -354,14 +527,16 @@ async function list(env, url) {
     include: ['httpMetadata', 'customMetadata'],
   });
   return json({
-    // 「.」开头的内部对象排在最前面；其中 .thumb/ 告诉前端哪些文件已有缩略图
+    // 「.」开头的内部对象排在最前面；.thumb/ 与 .hf/ 分别是缩略图与归档清单，前端攒齐全部分页后据此打标
     thumbs: res.objects.filter((o) => o.key.startsWith(THUMB)).map((o) => o.key.slice(THUMB.length)),
+    archived: res.objects.filter((o) => o.key.startsWith(HF_SIDECAR)).map((o) => o.key.slice(HF_SIDECAR.length)),
     items: res.objects.filter((o) => !o.key.startsWith('.')).map((o) => ({
       key: o.key,
       name: o.customMetadata?.name,
       url: `${url.origin}/file/${encodeURIComponent(o.key)}`,
       size: realSize(o),
       tg: isStub(o) || undefined,
+      hf: isHfStub(o) || undefined,
       contentType: o.httpMetadata?.contentType,
       uploaded: o.uploaded,
     })),
@@ -369,25 +544,38 @@ async function list(env, url) {
   });
 }
 
-// 从所有桶删除。Cache API 只能清当前机房的缓存，其他机房要等过期或在面板清除
+// 从所有桶删除，顺带清掉 Telegram 消息、HuggingFace 归档对象与各种内部清单。
+// Cache API 只能清当前机房的缓存，其他机房要等过期或在面板清除（gone 名单负责对外表现为 404）
 async function removeKeys(env, url, keys) {
   const stores = allStores(env);
   const main = configStore(env).bucket;
-  // Telegram 里的消息（备份清单与占位对象里记着 message_id）也删掉；删不掉不影响 R2 的删除
+  // Telegram 里的消息（清单里记着 message_id）与 HF 归档路径都先读清单拿到；清单读不出来也不影响 R2 的删除。
+  // collect 同时吃两种占位对象：tg 的清单有 chunks，hf 的清单有 path。
   const msgs = [];
-  const collect = async (obj) => obj && msgs.push(...(await obj.json()).chunks.map((c) => c.msg));
+  const arch = new Set();
+  const collect = async (obj) => {
+    if (!obj) return;
+    const m = await obj.json().catch(() => null);
+    if (m?.chunks) msgs.push(...m.chunks.map((c) => c.msg));
+    if (m?.path) arch.add(m.path);
+  };
   await Promise.all(
     keys.map(async (key) => {
       await collect(await main.get(SIDECAR + key));
-      for (const s of stores) if (isStub(await s.bucket.head(key))) await collect(await s.bucket.get(key));
+      await collect(await main.get(HF_SIDECAR + key));
+      for (const s of stores) if (isPlaceholder(await s.bucket.head(key))) await collect(await s.bucket.get(key));
     }),
   );
   await Promise.all([
     ...stores.map((s) => s.bucket.delete([...keys, ...keys.map((k) => THUMB + k)])),
-    main.delete(keys.map((k) => SIDECAR + k)),
+    main.delete([...keys.map((k) => SIDECAR + k), ...keys.map((k) => HF_SIDECAR + k), ...keys.map((k) => HF_QUEUE + k)]),
   ]);
   if (msgs.length && tgReady(env)) {
     await tgDelete(env, msgs).catch((err) => console.warn(JSON.stringify({ event: 'tg-delete-failed', error: err.message })));
+  }
+  // 路线 B 的 DeleteObject 立即释放空间（这正是它比 git 仓库适合图床的地方）；失败只记日志，对外仍是已删除
+  if (arch.size && hfReady(env)) {
+    await hfDelete(env, [...arch]).catch((err) => console.warn(JSON.stringify({ event: 'hf-delete-failed', error: err.message })));
   }
   // 记进已删除名单（其他机房的缓存由读路径挡掉），顺手从防盗链豁免名单里拿掉（背景图是自由填写的地址，不跟着删）
   const cur = await getSettings(env, { fresh: true });

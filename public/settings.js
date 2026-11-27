@@ -1,7 +1,7 @@
-// 设置页（管理员）：站点名称、防盗链与 RSS 阅读器放行、放行网站、链接域名、存储（R2 / Telegram）、主题与深浅色、登录页/上传页背景、页脚友情链接。
+// 设置页（管理员）：站点名称、防盗链与 RSS 阅读器放行、放行网站、链接域名、存储（R2 / Telegram / HuggingFace）、主题与深浅色、登录页/上传页背景、页脚友情链接。
 // 每项改动立即保存（POST /api/settings），服务端负责规范化与校验
 import { t } from './i18n.js';
-import { $, api, errText, gate, icon, initLang, logout, setDomains, setShape, setSite, snack, topbarShadow } from './ui.js';
+import { $, api, errText, gate, icon, initLang, logout, setDomains, setShape, setSite, size, snack, topbarShadow } from './ui.js';
 
 const MAX_BG = 5;
 const INTERVALS = [5, 10, 20, 40];
@@ -290,14 +290,21 @@ for (const row of document.querySelectorAll('[data-theme-flag]')) {
   row.onclick = () => save({ theme: { [f]: !settings.theme[f] } }, $('.toggle', row));
 }
 
-// ---------- 存储：仅 R2 / R2 + Telegram 备份 / 仅 Telegram ----------
+// ---------- 存储：R2 / Telegram / HuggingFace 的组合。枚举的第一段是主存，其余是备份盘 ----------
 const MODES = [
   ['r2', 'modeR2', 'hint_r2'],
   ['r2+tg', 'modeBackup', 'hint_r2tg'],
   ['tg', 'modeTg', 'hint_tg'],
+  ['r2+hf', 'modeR2Hf', 'hint_r2hf'],
+  ['tg+hf', 'modeTgHf', 'hint_tghf'],
+  ['r2+tg+hf', 'modeAll', 'hint_all'],
+  ['hf', 'modeHfOnly', 'hint_hf'], // 实验值：字节只进 bucket，读必须 Worker 代读
 ];
+// 某一段能不能用：tg 要 bot 密钥，hf 要 S3 密钥；r2 永远可用
+const ready = (token) => (token === 'tg' ? settings.tgReady : token === 'hf' ? settings.hfReady : true);
+const modeReady = (m) => m.split('+').every(ready);
+
 function renderStorage() {
-  const ready = settings.tgReady;
   const group = $('#storageMode');
   group.replaceChildren(
     ...MODES.map(([m, label]) => {
@@ -305,43 +312,61 @@ function renderStorage() {
       b.type = 'button';
       b.textContent = t(label);
       b.classList.toggle('on', m === settings.storage);
-      b.disabled = !ready && m !== 'r2';
+      b.disabled = !modeReady(m);
       b.onclick = () => m !== settings.storage && save({ storage: m }, group);
       return b;
     }),
   );
-  $('#storageHint').textContent = ready ? t(MODES.find(([m]) => m === settings.storage)[2]) : t('tgNotReady');
-  $('#tgBackup').hidden = !ready;
-  renderTg();
+  const miss = settings.storage.split('+').find((x) => !ready(x));
+  $('#storageHint').textContent = miss ? t(miss === 'hf' ? 'hfNotReady' : 'tgNotReady') : t(MODES.find(([m]) => m === settings.storage)[2]);
+  $('#tgBackup').hidden = !settings.tgReady;
+  $('#hfBackup').hidden = !settings.hfReady;
+  renderBackup('tg');
+  renderBackup('hf');
 }
 
-// 补备份：取未备份的 key，每次发 3 个；遇到限流按 Telegram 给的秒数等待后继续
-let tg = null;
-let progress = null;
+// 补备份：两个备份盘共用一套循环，只是端点、批量与文案不同。
+// Telegram 会限流（按它给的秒数等），HF 撞 503 Slow Down 走同一条 retryAfter 分支。
+const BACKUPS = {
+  tg: { card: '#tgBackup', note: '#tgBackupNote', btn: '#tgBackupBtn', status: '/api/tg/status', run: '/api/tg/backup', batch: 3 },
+  hf: { card: '#hfBackup', note: '#hfBackupNote', btn: '#hfBackupBtn', status: '/api/hf/status', run: '/api/hf/backup', batch: 10 },
+};
+const STATE = {
+  tg: (s) => t('tgBackupState', { backed: s.backed, pending: s.pending.length, tgOnly: s.tgOnly }),
+  hf: (s) => t('hfBackupState', {
+    backed: s.backed, pending: s.pending.length, queued: s.queued,
+    bytes: size(s.bytes), pct: s.quotaPct, files: s.files,
+  }),
+};
+const backup = { tg: { status: null, progress: null }, hf: { status: null, progress: null } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-function renderTg() {
-  const note = $('#tgBackupNote');
-  if (progress) note.textContent = t(progress.wait ? 'tgBackupWait' : 'tgBackupProgress', progress);
-  else note.textContent = tg ? t('tgBackupState', { backed: tg.backed, pending: tg.pending.length, tgOnly: tg.tgOnly }) : '';
-  $('#tgBackupBtn').disabled = Boolean(progress) || !tg?.pending.length;
+
+function renderBackup(kind) {
+  const c = BACKUPS[kind];
+  const st = backup[kind];
+  if (st.progress) $(c.note).textContent = t(st.progress.wait ? `${kind}BackupWait` : `${kind}BackupProgress`, st.progress);
+  else $(c.note).textContent = st.status ? STATE[kind](st.status) : '';
+  $(c.btn).disabled = Boolean(st.progress) || !st.status?.pending.length;
 }
-async function loadTg() {
-  if (!settings?.tgReady) return;
-  const r = await api('/api/tg/status');
-  if (r.ok) tg = r.body;
-  renderTg();
+async function loadBackup(kind) {
+  if (!settings || !ready(kind)) return;
+  const r = await api(BACKUPS[kind].status);
+  if (r.ok) backup[kind].status = r.body;
+  renderBackup(kind);
 }
-async function runBackup() {
-  if (progress || !tg?.pending.length) return;
-  const queue = [...tg.pending];
-  progress = { done: 0, total: queue.length };
+async function runBackup(kind) {
+  const c = BACKUPS[kind];
+  const st = backup[kind];
+  if (st.progress || !st.status?.pending.length) return;
+  const queue = [...st.status.pending];
+  st.progress = { done: 0, total: queue.length };
   let ok = 0;
   let failed = 0;
-  $('#tgBackupBtn').setAttribute('aria-busy', 'true');
-  renderTg();
+  $(c.btn).setAttribute('aria-busy', 'true');
+  renderBackup(kind);
   while (queue.length) {
-    const batch = queue.splice(0, 3);
-    const r = await api('/api/tg/backup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ keys: batch }) });
+    const batch = queue.splice(0, c.batch);
+    const r = await api(c.run, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ keys: batch }) });
     if (!r.ok) {
       snack(errText(r), { error: true });
       break;
@@ -349,25 +374,25 @@ async function runBackup() {
     const res = r.body.results;
     ok += res.filter((x) => x.status !== 'failed').length;
     failed += res.filter((x) => x.status === 'failed').length;
-    progress.done += res.length;
+    st.progress.done += res.length;
     queue.unshift(...batch.slice(res.length)); // 限流时没处理到的放回队首
     if (r.body.retryAfter) {
       for (let s = r.body.retryAfter + 1; s > 0; s--) {
-        progress.wait = true;
-        progress.s = s;
-        renderTg();
+        st.progress.wait = true;
+        st.progress.s = s;
+        renderBackup(kind);
         await sleep(1000);
       }
-      progress.wait = false;
+      st.progress.wait = false;
     }
-    renderTg();
+    renderBackup(kind);
   }
-  progress = null;
-  $('#tgBackupBtn').removeAttribute('aria-busy');
-  snack(t('tgBackupDone', { n: ok, failed }), { error: failed > 0 });
-  loadTg();
+  st.progress = null;
+  $(c.btn).removeAttribute('aria-busy');
+  snack(t(`${kind}BackupDone`, { n: ok, failed }), { error: failed > 0 });
+  loadBackup(kind);
 }
-$('#tgBackup').onclick = runBackup;
+for (const kind of Object.keys(BACKUPS)) $(BACKUPS[kind].card).onclick = () => runBackup(kind);
 
 // ---------- 启动 ----------
 let reauthing = null;

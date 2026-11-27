@@ -1,12 +1,15 @@
-// GET/HEAD /file/<key>：Cache API → R2（占位对象则从 Telegram 取）→ Telegram 备份 → 回源旧图床（取回后写入 R2）
+// GET/HEAD /file/<key>：Cache API → R2（占位对象则从 Telegram 取）→ Telegram 备份 → HuggingFace 归档 → 回源旧图床（取回后写入 R2）
 // 原样返回字节，不做任何转换；no-transform 让 Polish 等功能不处理图片（HDR 增益图要靠这个保住）
 import { isPassive, mimeFromName } from './mime.js';
 import { configStore, storesFor, writeStore } from './stores.js';
 import { getSettings } from './settings.js';
-import { SIDECAR, isStub, realSize, tgReady, tgStream } from './telegram.js';
+import { SIDECAR, isPlaceholder, isStub, realSize, tgReady, tgStream } from './telegram.js';
+import { SIDECAR as HF_SIDECAR, hfGet, hfHead, hfPath, hfReady, isHfStub } from './huggingface.js';
 
 const LONG_CACHE = 'public, max-age=31536000, immutable, no-transform';
 const MISS_CACHE = 'public, max-age=60';
+// 可执行类型（SVG/HTML 等）一律沙箱化，防止图床同源变成 XSS 跳板；R2 与归档两条读路共用这一份定义
+const SANDBOX_CSP = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox";
 const CACHE_PUT_LIMIT = 512 * 1024 * 1024; // Cache API 单个对象上限
 const LEGACY_LIMIT = 100 * 1024 * 1024; // 回源迁移时整个读进内存，超过就只转发不迁移
 // 防盗链内建放行的网页版 RSS 阅读器（含所有子域名）：它们会带自己域名的 Referer（App 版通常不带，本来就放行）。
@@ -58,6 +61,13 @@ export async function serveFile(request, env, ctx, url) {
     return backup;
   }
 
+  // 再往后是 HuggingFace 归档：清单在主桶 .hf/<key>，丢了就按 key 的纯函数路径直接问桶
+  const archived = await fromArchive(env, key, request, bg);
+  if (archived) {
+    if (archived.status === 200 && request.method === 'GET') maybeCache(ctx, cache, cacheUrl, archived);
+    return archived;
+  }
+
   return fromLegacy(request, env, ctx, key, cache, cacheUrl);
 }
 
@@ -79,11 +89,11 @@ async function fromStore(env, bucket, key, request, bg) {
   } catch (e) {
     err = e; // 范围越界等情况 R2 会抛错
   }
-  // 占位对象：Range 指的是真实文件，不是清单，所以重新整个读出清单
-  if (err || (isStub(obj) && obj.range && request.headers.has('Range'))) {
+  // 占位对象（Telegram / HuggingFace）：Range 指的是真实文件，不是清单，所以重新整个读出清单
+  if (err || (isPlaceholder(obj) && obj.range && request.headers.has('Range'))) {
     const head = await bucket.head(key);
     if (!head) return null;
-    if (isStub(head)) obj = await bucket.get(key, { onlyIf: request.headers });
+    if (isPlaceholder(head)) obj = await bucket.get(key, { onlyIf: request.headers });
     else if (request.headers.has('Range')) {
       return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${head.size}` } });
     } else throw err;
@@ -93,6 +103,8 @@ async function fromStore(env, bucket, key, request, bg) {
   const headers = objectHeaders(obj, key);
   if (!('body' in obj)) return new Response(null, { status: 304, headers }); // 条件请求命中
   if (isStub(obj)) return fromTelegram(env, request, headers, await obj.json(), bg);
+  // 实验主存：字节只在 HuggingFace，清单在占位对象正文里（侧车 .hf/<key> 是同一份）
+  if (isHfStub(obj)) return fromBucket(env, request, headers, await obj.json(), bg);
 
   if (obj.range && request.headers.has('Range')) {
     const { start, end } = rangeOf(obj.range, obj.size);
@@ -145,6 +157,83 @@ async function fromTelegram(env, request, headers, manifest, bg) {
     );
   }
   return new Response(body, { status: range ? 206 : 200, headers });
+}
+
+// HuggingFace 归档：清单在主桶 .hf/<key>（连同原对象的 httpMetadata）。
+// 清单丢了（主桶整桶出事）就按 key 的纯函数路径直接问桶——路径由 hfPath() 决定，所以备份本身不依赖 R2。
+async function fromArchive(env, key, request, bg) {
+  if (!hfReady(env)) return null;
+  const side = await configStore(env).bucket.get(HF_SIDECAR + key);
+  let manifest;
+  let headers;
+  if (side) {
+    manifest = await side.json();
+    headers = objectHeaders(side, key);
+  } else {
+    const path = await hfPath(env, key);
+    const head = await hfHead(env, path).catch(() => null);
+    if (!head) return null;
+    manifest = { v: 1, path, size: head.size };
+    headers = archiveHeaders(key, head);
+  }
+  if (!manifest.size) return null;
+  if (request.method === 'HEAD') {
+    headers.set('Content-Length', String(manifest.size));
+    return new Response(null, { status: 200, headers });
+  }
+  return fromBucket(env, request, headers, manifest, bg);
+}
+
+// 从桶里取字节：网关的 GetObject 通常 302 到 HF CDN，fetch 默认跟随，访客看不见也不会带上本站 Cookie。
+// Range 交给上游判：回 206 就照它的 Content-Range 透传；上游若不认 Range（回 200 全量）就老实回 200，
+// 绝不自己编 Content-Range——那会让视频拖动读到错位的字节。
+async function fromBucket(env, request, headers, manifest, bg) {
+  const size = manifest.size;
+  const range = parseRange(request.headers.get('Range'), size);
+  if (range === false) return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${size}` } });
+  let res;
+  try {
+    res = await hfGet(env, manifest.path, range ? `bytes=${range.start}-${range.end}` : null);
+  } catch (err) {
+    console.warn(JSON.stringify({ event: 'hf-read-failed', error: err.message }));
+    return plain(502, 'Archive unavailable');
+  }
+  if (!res) return null; // 清单还在、对象没了：继续往下走（回源旧图床 / 404）
+  if (range && res.status === 206) {
+    headers.set('Content-Range', res.headers.get('Content-Range') || `bytes ${range.start}-${range.end}/${size}`);
+    headers.set('Content-Length', String(range.end - range.start + 1));
+    if (size <= CACHE_PUT_LIMIT) fillCacheFromBucket(env, bg, manifest, headers, size);
+    return new Response(res.body, { status: 206, headers });
+  }
+  if (res.status !== 200) return null;
+  headers.set('Content-Length', String(Number(res.headers.get('Content-Length')) || size));
+  return new Response(res.body, { status: 200, headers });
+}
+
+// Range 回应不进缓存：后台再取一整份塞进缓存，之后的 Range 请求由 Cache API 直接切（与 Telegram 备份同处理）
+function fillCacheFromBucket(env, bg, manifest, headers, size) {
+  const full = new Headers(headers);
+  full.delete('Content-Range');
+  full.set('Content-Length', String(size));
+  bg.ctx.waitUntil(
+    hfGet(env, manifest.path)
+      .then((r) => r && bg.cache.put(new Request(bg.cacheUrl), new Response(r.body, { status: 200, headers: full })))
+      .catch((err) => console.warn('hf cache fill failed', err.message)),
+  );
+}
+
+// 没有侧车清单时的响应头：Content-Type 来自上游 HEAD，其余与 objectHeaders 同一套安全策略
+function archiveHeaders(key, head) {
+  const h = new Headers();
+  h.set('Content-Type', head.ct || mimeFromName(key));
+  h.set('Content-Disposition', 'inline');
+  h.set('Cache-Control', LONG_CACHE);
+  h.set('Accept-Ranges', 'bytes');
+  h.set('Access-Control-Allow-Origin', '*');
+  h.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, ETag');
+  h.set('X-Content-Type-Options', 'nosniff');
+  if (!isPassive(h.get('Content-Type'))) h.set('Content-Security-Policy', SANDBOX_CSP);
+  return h;
 }
 
 // 只认单段 bytes=a-b / a- / -n。没有或看不懂返回 null（按整个文件回应），无法满足返回 false
@@ -215,9 +304,7 @@ function objectHeaders(obj, key) {
   h.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, ETag');
   h.set('X-Content-Type-Options', 'nosniff');
   // SVG、HTML 等可以带脚本：禁止执行，防止被当成 XSS 跳板（同域的 /api 会带上管理员的 Cookie）
-  if (!isPassive(h.get('Content-Type'))) {
-    h.set('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox");
-  }
+  if (!isPassive(h.get('Content-Type'))) h.set('Content-Security-Policy', SANDBOX_CSP);
   return h;
 }
 

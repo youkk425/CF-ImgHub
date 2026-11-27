@@ -21,6 +21,10 @@
     { "name": "LOGIN_LIMITER", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 } }
   ],
 
+  // 补备份：每 6 小时扫一遍 .hfq/（HuggingFace 归档的失败/超限队列）。
+  // 没配 HF 密钥时 scheduled 里直接返回，不产生任何外呼与费用。
+  "triggers": { "crons": ["0 */6 * * *"] },
+
   // 部署时保留面板里手动设的变量。以下可选变量不写在这里、只在面板设置，
   // 免得每次部署被覆盖、也免得一键部署的用户继承本站的值：
   //   LEGACY_ORIGIN  R2 找不到时回源的旧图床地址（取回后写入 R2）；不设则关闭
@@ -37,5 +41,13 @@
   //   UPLOAD_PASSWORD  上传页密码
   //   ADMIN_USER / ADMIN_PASSWORD  后台管理账号
   //   UPLOAD_TOKEN     可选，本机脚本用 Authorization: Bearer 上传
+  //
+  // HuggingFace 归档（可选，三项配齐才生效；设好后在设置页把存储方式改成带 HF 的组合）：
+  //   HF_S3_ACCESS_KEY  密钥。HF「Access Tokens」页选中某个 write 级 token →「Generate S3 credentials」得到的 AK（HFAK…）
+  //   HF_S3_SECRET         密钥。同一处生成的 SK；权限等于那个 token，请只用授权到单个桶的 write token
+  //   HF_NAMESPACE         变量（文本）。HF 用户名或组织名，决定 endpoint https://<namespace>.s3.hf.co
+  //   HF_BUCKET            变量（文本）。桶名，例如 imghub-archive（桶要在 HF 上人工建，程序不建也不删桶）
+  //   HF_PREFIX            变量，可选。桶内顶层前缀，默认 images；留空即 images
+  //   HF_ENDPOINT          变量，可选。默认按 namespace 推算，只在本机冒烟时才需要改；生产不要指向镜像（会把密钥发给别人）
   //   TG_BOT_TOKEN / TG_CHAT_ID  可选，Telegram 存储（bot token 与频道 id）；设好后在设置页选存储方式
 }

@@ -14,9 +14,11 @@ export const SIDECAR = '.tg/';
 const PATH_TTL = 50 * 60 * 1000; // getFile 给的下载路径至少有效 1 小时
 
 export const tgReady = (env) => Boolean(env.TG_BOT_TOKEN && env.TG_CHAT_ID);
-export const isStub = (obj) => obj?.customMetadata?.tg === '1';
-// 对象的真实大小（占位对象看 customMetadata）
-export const realSize = (obj) => (isStub(obj) ? Number(obj.customMetadata.size) || 0 : obj.size);
+// 占位对象：正文是清单，真实字节在别处（Telegram 频道 / HuggingFace bucket），真实大小记在 customMetadata.size。
+// tg:'1' 是老标记（保留兼容），stub:'tg'|'hf' 是新标记——两种主存模式共存时读路径靠它分流。
+export const isStub = (obj) => obj?.customMetadata?.tg === '1' || obj?.customMetadata?.stub === 'tg';
+export const isPlaceholder = (obj) => isStub(obj) || Boolean(obj?.customMetadata?.stub);
+export const realSize = (obj) => (isPlaceholder(obj) ? Number(obj.customMetadata.size) || 0 : obj.size);
 
 export class TgError extends Error {
   constructor(message, retryAfter) {

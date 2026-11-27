@@ -2,192 +2,111 @@
   <img src="banner.zh-Hant.svg" width="100%" alt="CF ImgHub — 為個人部落格打造的圖床">
 </p>
 
-<h1 align="center">CF-ImgHub</h1>
+<h1 align="center">CF-ImgHub（個人自用 Fork · HuggingFace 主存）</h1>
 
 <p align="center">
-  為個人部落格打造的圖床，跑在 Cloudflare Workers + R2 上。<br>
-  快，瀏覽器本機壓縮，且支援實況照片與 HDR。
+  這是 <a href="https://github.com/TG-Twilight/CF-ImgHub">TG-Twilight/CF-ImgHub</a> 的個人自用 Fork。<br>
+  跑在 Cloudflare Workers 上，但圖片位元組<b>不進 R2，而是主存到 HuggingFace Storage Buckets</b>（實驗模式）。
 </p>
 
+> [!IMPORTANT]
+> **這是我的個人自用副本，不打算維護，也不接受功能請求。** 想用這個圖床、看完整文件或提 Issue / PR，請去**原專案**：
+>
+> ### 👉 https://github.com/TG-Twilight/CF-ImgHub
+>
+> 下面的內容只作為我自己部署時的備忘。其中「HuggingFace 主存」是我這份 Fork 真正使用的玩法，其餘功能說明和部署步驟都來自上游，隨時可能過期。
+
 <p align="center">
-  <a href="https://github.com/TG-Twilight/CF-ImgHub/fork"><img src="fork.zh-Hant.svg" alt="Fork 並部署"></a>
+  <a href="https://github.com/TG-Twilight/CF-ImgHub/fork"><img src="fork.zh-Hant.svg" alt="到原專案 Fork 並部署"></a>
 </p>
 
 <p align="center">
   <a href="../README.md">简体中文</a> · <b>繁體中文</b> · <a href="README.en.md">English</a>
 </p>
 
-## 特色
+## 這個 Fork 的看點：HuggingFace 當主存
 
-### 快
+上游預設把圖片存在 R2，HuggingFace（HF）只作為可選的**歸檔備份**。我這份 Fork 的核心玩法，是打開上游那個預設不選的「**實驗：僅 HuggingFace**」模式，把 HF Storage Buckets 直接當成圖片的**主儲存**：
 
-圖片直接從 Cloudflare 邊緣回傳：先查快取，未命中再讀 R2，中間沒有資料庫，也不繞道第三方儲存。
+- **圖片位元組只進 HF bucket**，R2 裡只留幾百位元組的清單和縮圖，管理頁、統計、刪除照常運作。
+- **省下 R2 的儲存與操作費用**：R2 不再堆圖片本體，只承擔設定和縮圖這點小資料。
+- **白嫖 HF 的 100 GB 免費額度**當圖床碟。
 
-### 自動壓縮
+> [!WARNING]
+> 上游明確把這檔標為**實驗**，代價要清楚：
+>
+> - 每次快取未命中都要 Worker 代讀 HF（HF 讀上限約 16 次／秒、只認簽章不認條件請求），**首屏比 R2 慢**。
+> - 單一檔案上限 **30 MB**（Worker 記憶體限制）。
+> - 100 GB 寫滿後上傳直接報 `hf_quota`。
+> - 行為可能隨上游調整，穩定性不如 R2。
 
-圖片在上傳前預設會經過一次壓縮（瀏覽器本機完成），預設轉 **AVIF**，也可選 WebP / JPEG / PNG 或不壓縮；提供檔位選擇，可限制最長邊，當然，**壓完變大時自動用原圖**。
+所以我只在自己這種低流量、圖不大、想省 R2 錢的個人部落格上用它；**正式生產、大圖、高併發場景請乖乖用 R2**。完整的技術權衡見 `../docs/Huggingface-主存代價分析.md`。
 
-### 實況照片與 HDR
+## 關於這個 Fork
 
-上傳時依檔案內容辨識實況照片（Google Motion Photo、OPPO / 一加 / realme 的 O Live，含微信轉存）和 HDR 照片（Ultra HDR / ISO 21496-1 增益圖）。HDR 照片、動圖、SVG、ICO、影片原樣上傳；實況照片拆開壓縮後按原結構裝回，相簿照樣辨識：
+- **用途**：只為我自己的部落格服務，不對外提供圖床。
+- **與上游的關係**：預設跟隨上游，靠 **Sync fork** 拉取更新；不做長期分叉，不改核心邏輯。HF 主存是上游已有的實驗能力，我只是把它選成自己的預設儲存。
+- **個性化改動**：只限於設定層面——儲存桶名、金鑰、網域、防盜鏈放行名單、主題色、儲存模式等，都在 Cloudflare 面板和設定頁裡調，不落到程式碼裡。
+- **為什麼不建議用我這份**：上游的 Fork 部署流程本來就是給「每人一份」設計的。想要 HF 主存，直接 Fork 上游、在設定頁選「實驗：僅 HuggingFace」即可，不需要經過我這份。
 
-| 檔位 | 做法 |
-|------|------|
-| 原樣 | 不改動 |
-| 精簡 | 去掉手機私有資料，畫質無損 |
-| **標準**（預設） | 再重新壓縮主圖，HDR 與影片都保留，體積約減半 |
-| 緊湊 | 再把實況影片轉為 SDR |
-| 極致 | 再去掉 HDR，主圖按最長邊縮小 |
+## 上游功能速覽
 
-伺服器從不改動檔案位元組。
+以下均為原專案能力，詳細說明見上游 README。
 
-## 其他功能
+- **快**：圖片從 Cloudflare 邊緣回傳，先查快取、未命中讀儲存，無資料庫、不繞第三方儲存。
+- **瀏覽器本機壓縮**：上傳前在瀏覽器壓縮，預設轉 AVIF，可選 WebP / JPEG / PNG 或不壓縮；壓完變大時自動用原圖。
+- **實況照片與 HDR**：識別 Motion Photo / O Live 與 Ultra HDR 增益圖，按檔位精簡或重壓，伺服器從不改動檔案位元組。
+- **兩種身分**：上傳者憑密碼上傳、可撤回 24 小時內的上傳；管理員可瀏覽、搜尋、批次刪除、改設定。
+- **防盜鏈、易讀檔名、多網域、主題色、去除 GPS** 等均在設定頁調整。
+- **可選 Telegram 儲存**：作為備份，或只存 Telegram 實現近乎無上限儲存。
+- **可選 HuggingFace 儲存**：既可作 R2 的歸檔備份（`r2+hf`），也可像我這份一樣選成主存（`hf`，實驗）。
 
-- **兩種身分**：上傳者只需密碼，可撤回 24 小時內的上傳；管理員可瀏覽、搜尋、批次刪除和修改設定
-- **防盜鏈**：可自訂放行網站，單張圖片可單獨放行；直接開啟和 RSS 閱讀器不受影響
-- **易讀的檔名**：預設 `ImgHub-20261121-153045-k7q2.avif`，也可保持原名
-- **主題色、深淺色、多網域、背景圖、快捷連結**：都在設定頁調整；深淺色可強制統一
-- **Telegram 儲存（選用）**：作為 R2 的備份，或只存 Telegram 以實現近乎無上限的儲存
-- **去除定位**：上傳前清除照片與影片裡的 GPS，不動畫質、實況與 HDR（預設開啟，可關）
-- **腳本上傳**：用 Bearer Token 呼叫 `/api/upload`
-- Material 3 Expressive 介面，亮 / 暗色，自訂色彩搭配，简体中文 / 繁體中文 / English
-
-## 截圖
-
-<details>
-<summary>展開截圖</summary>
-
-**上傳頁**
-
-<img src="screenshots/upload.avif" width="100%" alt="上傳頁">
-
-**後臺管理**
-
-<img src="screenshots/admin.avif" width="100%" alt="後臺管理">
-
-**圖床設置**
-
-<img src="screenshots/settings.avif" width="100%" alt="圖床設置">
-
-**登入頁**
-
-<img src="screenshots/login.avif" width="100%" alt="登入頁">
-
-</details>
-
-## 部署
+## 我的部署備忘
 
 <details>
-<summary>展開部署步驟</summary>
+<summary>展開（僅自用記錄，通用步驟請看上游）</summary>
 
-準備：一個 Cloudflare 帳戶（免費版即可）和一個 GitHub 帳戶，想用自己的網域需要將其託管在 Cloudflare。
+準備：一個 Cloudflare 帳戶（免費版即可）、一個 GitHub 帳戶、一個 HuggingFace 帳戶；要用自己的網域需託管在 Cloudflare。
 
-### 第 1 步：Fork 並部署
-
-部署時要用到下面 5 個密鑰：
+部署要填 5 個基礎金鑰：
 
 | 名稱 | 填什麼 |
 |------|------|
-| `SESSION_SECRET` | 一串隨機長字串，用來簽署登入工作階段 |
+| `SESSION_SECRET` | 隨機長字串，用來簽章登入工作階段 |
 | `UPLOAD_PASSWORD` | 上傳頁的密碼 |
 | `ADMIN_USER` | 管理頁的帳號 |
 | `ADMIN_PASSWORD` | 管理頁的密碼 |
-| `UPLOAD_TOKEN` | 腳本上傳用的 Token；不用腳本也請填一串隨機字元 |
+| `UPLOAD_TOKEN` | 腳本上傳用的 Token |
 
-隨機字串可以用密碼管理器產生，或在終端機執行 `openssl rand -hex 32`。名稱區分大小寫，值的前後不要帶空格。
+1. 從**上游** Fork 一份到自己的 GitHub（不要從我這份 Fork）
+2. Cloudflare 控制台 →「R2 物件儲存」→ 建立儲存桶 `cf-imghub`（HF 主存下它只放清單和縮圖，仍需要）
+3. 「Workers 和 Pages」→「建立」→「匯入儲存庫」，選剛 Fork 的儲存庫
+4. 專案名 `cf-imghub`（與 `wrangler.jsonc` 的 `name` 一致），建置命令 `npm run build`，部署命令 `npx wrangler deploy`
+5. 部署後到「設定」→「變數和機密」，按上表逐個新增（類型選「密鑰」），再點「部署」
 
-1. [Fork 本倉庫](https://github.com/TG-Twilight/CF-ImgHub/fork) 到你的 GitHub 帳戶
-2. 打開 [Cloudflare 主控台](https://dash.cloudflare.com/)，左側選「R2 物件儲存」→「建立儲存桶」，名稱填 `cf-imghub`
-3. 左側選「Workers 和 Pages」→「建立」→「匯入存放庫」
-4. 第一次使用要先連接 GitHub：點「連接 GitHub」，在跳出的 GitHub 頁面選擇你的帳戶，安裝並授權 **Cloudflare Workers and Pages** 應用程式。倉庫權限選「All repositories」，或選「Only select repositories」並勾選剛 Fork 的倉庫
-5. 回到 Cloudflare，選擇你的 GitHub 帳戶和剛 Fork 的倉庫，點「下一步」
-6. 專案名稱填 `cf-imghub`（必須與倉庫裡 `wrangler.jsonc` 的 `name` 一致），建置指令填 `npm run build`，部署指令保持 `npx wrangler deploy`
-7. 點「部署」，等待建置完成（約 1–2 分鐘）
-8. 進入 `cf-imghub` →「設定」→「變數和密碼」，按上表逐個「新增」，類型選「密碼」，最後點「部署」
+### 開啟 HuggingFace 主存
 
-完成後會得到一個 `https://cf-imghub.<你的子網域>.workers.dev` 網址，已經可以打開使用。
+1. HF → 頭像 → Settings → Storage Buckets，建一個私有桶，例如 `imghub-archive`
+2. Settings → Access Tokens → 建一個 write 級 token（勾選對應桶）→「Generate S3 credentials」，記下 `HFAK…` 和 SK（SK 只顯示一次）
+3. 到 Worker 的「變數和機密」新增：
 
-**以後更新**：在你 Fork 的倉庫頁面點 **Sync fork** →「Update branch」，Cloudflare 會自動重新部署。
+   | 名稱 | 類型 | 值 |
+   |------|------|----|
+   | `HF_S3_ACCESS_KEY` | 密鑰 | 第 2 步的 AK |
+   | `HF_S3_SECRET` | 密鑰 | 第 2 步的 SK |
+   | `HF_NAMESPACE` | 文字 | 你的 HF 使用者名稱或組織名 |
+   | `HF_BUCKET` | 文字 | 第 1 步的桶名 |
 
-### 第 2 步：綁定自己的網域（建議）
+4. 打開 `https://<你的網域>/settings`，在「儲存」裡選「**實驗：僅 HuggingFace**」
 
-`workers.dev` 網址無法讀取 Cloudflare 的邊緣快取，每次都要讀 R2，因此正式使用強烈建議綁定網域：
+以後更新：在自己 Fork 的儲存庫點 **Sync fork** →「Update branch」，Cloudflare 會自動重新部署。
 
-1. 打開 [Cloudflare 主控台](https://dash.cloudflare.com/)，左側選「Workers 和 Pages」，點進 `cf-imghub`
-2. 進入「設定」→「網域和路由」→「新增」→「自訂網域」
-3. 填寫子網域，如 `img.example.com`，確認。DNS 記錄和憑證會自動建立，幾分鐘內生效
-
-### 第 3 步：確認可以用
-
-1. 打開 `https://img.example.com/`，輸入上傳密碼，傳一張圖片，複製回傳的連結在新分頁打開
-2. 打開 `https://img.example.com/admin`，用管理帳號登入，能看到剛才那張圖
-
-防盜鏈預設關閉，要開啟時，先在設定頁的「放行網站」把預置的範例網域換成你部落格的網域（子網域一併放行），再打開開關，否則部落格裡的圖片會被擋下。
-
-### 第 4 步（選用）：加上 Telegram 儲存
-
-不需要可以跳過，只用 R2 也能正常使用。三種存法：
-
-| 模式 | 說明 |
-|------|------|
-| 僅 R2（預設） | 最快 |
-| R2 + Telegram | 照常從 R2 讀取，另存一份到 Telegram（容災）；R2 裡找不到時自動改從 Telegram 讀 |
-| 僅 Telegram | 不佔 R2 空間（R2 只留很小的索引）；沒被快取的圖片首次開啟慢 0.5–3 秒；單個檔案最大 100MB |
-
-1. **建立 bot**：在 Telegram 開啟 [@BotFather](https://t.me/BotFather)，傳送 `/newbot`，依提示命名，最後會收到形如 `123456789:AA…` 的 token。token 相當於 bot 的密碼，不要公開
-2. **建立頻道**：新建一個頻道，設為私人即可
-3. **把 bot 設為頻道管理員**：頻道資訊 →「管理員」→「新增管理員」，搜尋 bot 的使用者名稱，至少勾選「發布訊息」和「刪除訊息」
-4. **取得頻道 id**：在電腦瀏覽器開啟 [Telegram Web](https://web.telegram.org/a/)，點進這個頻道，網址列 `#` 後面形如 `-1001234567890` 的數字就是（連同減號）
-5. **填密鑰**：「Workers 和 Pages」→ `cf-imghub` →「設定」→「變數和密鑰」→「新增」，類型選「密鑰」，分別新增 `TG_BOT_TOKEN`（第 1 步的 token）和 `TG_CHAT_ID`（第 4 步的 id），再點「部署」
-6. **選模式**：開啟 `https://img.example.com/settings`，在「儲存」裡選新上傳存到哪裡
-7. **給既有檔案補備份**（選用）：點「備份現有檔案到 Telegram」右側的「開始備份」。檔案多時會被 Telegram 限流，頁面會自動等待後繼續，期間不要關閉頁面
-
-切換模式只影響之後上傳的檔案。刪除圖片時，頻道裡對應的訊息會一起刪掉。
-
-### 以後修改密碼或設定
-
-都在「Workers 和 Pages」→ `cf-imghub` →「設定」→「變數和密碼」：
-
-- **修改**：點該項右側的編輯，填入新的「值」，再點「部署」
-- **新增**：點「新增」，類型選「**密鑰**」，填寫「變數名稱」和「值」，再點「部署」
-- 密碼類一律選「密鑰」；選「文字」也能用，但值會明文顯示在面板上
-- 修改 `SESSION_SECRET` 會讓所有人重新登入；修改某個密碼只會讓對應的登入失效
-
-多個網域：在 Worker 的「設定 → 網域和路由」再新增自訂網域即可，連結預設跟隨開啟頁面時的網域。把這些網域登記在設定頁的「連結網域」後，上傳頁和管理頁頂欄會出現地球按鈕，可隨時切換連結用哪個網域。
-
-### 常見問題
-
-| 現象 | 原因與處理 |
-|------|------|
-| 匯入存放庫時找不到 Fork 的倉庫 | Cloudflare 的 GitHub 應用程式沒有這個倉庫的權限。到 GitHub「Settings」→「Applications」→ Cloudflare Workers and Pages →「Configure」，把倉庫加進去 |
-| 登入時提示「伺服器尚未設定這種登入方式」 | 缺少 `SESSION_SECRET`，或缺少這個頁面的密碼（上傳頁要 `UPLOAD_PASSWORD`，管理頁要 `ADMIN_USER` 和 `ADMIN_PASSWORD`）。到「變數和密碼」核對名稱拼寫 |
-| 提示「密碼不正確」，但確定沒輸錯 | 檢查「值」的前後是否多了空格或換行 |
-| 腳本上傳回傳 401 | `UPLOAD_TOKEN` 沒設定，或與腳本裡用的不一致 |
-| 部落格裡的圖片顯示不出來 | 開了防盜鏈，但「放行網站」裡沒有部落格的網域 |
-| 下載回來的圖片比上傳時小、HDR 效果沒了 | 網域所在區域開了 Polish（Pro 以上方案才有）。在該網域的「規則」裡新建一條設定規則（Configuration Rule）：主機名稱等於圖床網域，Polish 設為關閉 |
-| 「儲存」裡後兩個選項是灰的 | 缺少 `TG_BOT_TOKEN` 或 `TG_CHAT_ID`，或名稱拼錯；改完要點「部署」 |
-| 備份到 Telegram 失敗 | bot 不是頻道管理員或沒有「發布訊息」權限，或 `TG_CHAT_ID` 漏了前面的 `-100` |
+可選：綁定自訂網域（`workers.dev` 讀不到邊緣快取）、改用 `r2+hf` / `r2+tg` 等組合——完整步驟見上游 README 的「部署」章節。
 
 </details>
 
-## 用腳本上傳
-
-```bash
-curl -H "Authorization: Bearer $UPLOAD_TOKEN" \
-     -H "Content-Type: image/avif" \
-     --data-binary @photo.avif \
-     "https://img.example.com/api/upload?name=photo.avif"
-# 回傳 JSON，其中 url 為圖片連結；加 &naming=original 保持原檔名
-```
-
-## 本機開發
-
-```bash
-npm install
-cp .dev.vars.example .dev.vars   # 填入密鑰
-npm run dev
-```
-
 ## 授權
 
-[AGPL-3.0-or-later](../LICENSE)。圖示來自 [Material Icons](https://github.com/google/material-design-icons)（Apache-2.0）；瀏覽器端編碼器來自 [jSquash](https://github.com/jamsinclair/jSquash)（Apache-2.0），影片處理用 [Mediabunny](https://github.com/Vanilagy/mediabunny)（MPL-2.0），均在建置時複製，不在倉庫中。
+沿用上游許可：[AGPL-3.0-or-later](../LICENSE)。圖示來自 [Material Icons](https://github.com/google/material-design-icons)（Apache-2.0）；瀏覽器端編碼器來自 [jSquash](https://github.com/jamsinclair/jSquash)（Apache-2.0），影片處理用 [Mediabunny](https://github.com/Vanilagy/mediabunny)（MPL-2.0），均在建置時複製，不在儲存庫中。
+
+所有功能與設計版權歸上游作者，感謝 [TG-Twilight](https://github.com/TG-Twilight) 的原創工作。

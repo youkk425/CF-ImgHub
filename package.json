@@ -34,6 +34,18 @@
       },
       "UPLOAD_TOKEN": {
         "description": "脚本上传用的 Token，不用也请填随机字符串。 / Bearer token for script uploads; fill a random string if unused."
+      },
+      "HF_S3_ACCESS_KEY": {
+        "description": "可选：HuggingFace 归档的 S3 Access Key（HFAK…）。留空则不启用 / Optional HF Storage Buckets access key; leave empty to disable."
+      },
+      "HF_S3_SECRET": {
+        "description": "可选：对应的 Secret Key / Optional matching secret key."
+      },
+      "HF_NAMESPACE": {
+        "description": "可选：HF 用户名或组织名 / Optional HF username or organization."
+      },
+      "HF_BUCKET": {
+        "description": "可选：HF Storage Bucket 名称 / Optional HF Storage Bucket name."
       }
     }
   },

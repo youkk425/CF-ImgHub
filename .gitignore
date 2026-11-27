@@ -32,3 +32,5 @@ public/vendor/
 
 # 原型与实验脚本：只留本地
 prototype/
+/.security
+/.codeartsdoer
