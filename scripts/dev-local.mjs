@@ -1,12 +1,14 @@
-// 零安装的本地预览运行时：内存版 R2 + 内存版 Cache API + public/ 静态资源 + 登录限速
-// +（--hf 时）一个假的 HuggingFace Storage Buckets 网关，用来在本地跑通归档/实验主存的线路。
+// 零安装的本地预览运行时：内存版 Workers KV（元数据）+ 内存版 Cache API + public/ 静态资源 + 登录限速
+// +（--hf 时）一个假的 HuggingFace Storage Buckets 网关，用来在本地跑通 hf / tg+hf 的字节线路。
 //
 // 用途：这台机器上不想 `npm install`（wrangler 与浏览器端编码器都在依赖里）时，仍能在浏览器里
-// 点完上传、管理、设置。它不是 workerd 的替代品：R2/Cache 都在内存里，重启即清空，也没有 Durable Objects。
+// 点完上传、管理、设置。它不是 workerd 的替代品：KV/Cache 都在内存里，重启即清空，也没有 Durable Objects。
 // 标准做法仍然是 `npm install` + `npm run dev`（见 RunLocal.md 第 2 节）。
 //
-//   node scripts/dev-local.mjs                       # 只存 R2，端口 8787
-//   node scripts/dev-local.mjs --hf                  # 再接一个假 HF 网关（端口 8788），可试「实验：仅 HuggingFace」
+//   node scripts/dev-local.mjs --hf        # 接一个假 HF 网关（端口 8788），可传图（hf 主存），端口 8787
+//
+// 注意：R2 已移除，默认存储是 Telegram（tg），但本地没有假 TG 网关——要真正传图，请带 --hf 跑，
+// 并在 /settings 的「存储」里选「实验：仅 HuggingFace」。只带真实 TG 密钥时也能传（走真 Telegram）。
 //
 // 凭据优先级：命令行 > .dev.vars > 内置开发默认值（会在启动时打印）。
 
@@ -64,92 +66,38 @@ const bytesOf = async (v) => {
   return new Uint8Array(await new Response(v).arrayBuffer()); // ReadableStream（上传正文）
 };
 
-// R2 的够用子集：put / get(opts.range、opts.onlyIf) / head / delete / list(prefix、cursor、include)
-class Bucket {
-  #map = new Map();
 
-  async put(key, value, opts = {}) {
-    const bytes = await bytesOf(value);
-    const etag = crypto.randomUUID().replaceAll('-', '');
-    const rec = {
-      key,
-      bytes,
-      size: bytes.byteLength,
-      etag,
-      httpEtag: `"${etag}"`,
-      uploaded: new Date(),
-      httpMetadata: opts.httpMetadata ?? {},
-      customMetadata: opts.customMetadata,
-    };
-    this.#map.set(key, rec);
-    return this.#view(rec, false);
-  }
-
-  async head(key) {
-    const rec = this.#map.get(key);
-    return rec ? this.#view(rec, false) : null;
-  }
+// 内存版 Workers KV：meta.js 用到的够用子集 get(type) / put(metadata) / delete / list(prefix、cursor、limit)
+class KV {
+  #map = new Map(); // key -> { value, metadata }
 
   async get(key, opts = {}) {
     const rec = this.#map.get(key);
     if (!rec) return null;
-    const inm = opts.onlyIf?.get?.('if-none-match');
-    if (inm && inm.split(',').map((s) => s.trim()).includes(rec.httpEtag)) return this.#view(rec, false); // 条件命中：无 body
-    const h = opts.range?.get?.('range');
-    const m = h && /^bytes=(\d*)-(\d*)$/.exec(h.trim());
-    if (m) {
-      const { size } = rec;
-      const start = m[1] === '' ? Math.max(0, size - Number(m[2])) : Number(m[1]);
-      const end = m[1] === '' || m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1);
-      if (start > end || start >= size) throw new Error('range not satisfiable'); // 与 R2 一致：越界抛错
-      return this.#view(rec, true, { offset: start, length: end - start + 1 });
-    }
-    return this.#view(rec, true);
+    if (opts.type === 'arrayBuffer') return rec.value.slice().buffer;
+    if (opts.type === 'json') return JSON.parse(new TextDecoder().decode(rec.value));
+    return new TextDecoder().decode(rec.value);
   }
 
-  async delete(keys) {
-    const list = Array.isArray(keys) ? keys : [keys];
-    for (const k of list) this.#map.delete(k);
-    return list.length;
+  async put(key, value, opts = {}) {
+    const v = value instanceof ArrayBuffer ? new Uint8Array(value) : await bytesOf(value);
+    this.#map.set(key, { value: v, metadata: opts.metadata });
   }
 
-  async list({ prefix = '', limit = 1000, cursor, include = [] } = {}) {
+  async delete(key) {
+    this.#map.delete(key);
+  }
+
+  async list({ prefix = '', limit = 1000, cursor } = {}) {
     const all = [...this.#map.keys()].filter((k) => k.startsWith(prefix)).sort();
     const from = cursor ? all.indexOf(cursor) + 1 : 0;
     const page = all.slice(from, from + limit);
+    const complete = from + page.length >= all.length;
     return {
-      objects: page.map((k) => this.#view(this.#map.get(k), false, null, include)),
-      truncated: from + page.length < all.length,
-      cursor: page.length ? page[page.length - 1] : undefined,
+      keys: page.map((name) => ({ name, metadata: this.#map.get(name)?.metadata })),
+      list_complete: complete,
+      cursor: complete ? undefined : page[page.length - 1],
     };
-  }
-
-  #view(rec, withBody, range = null, include = ['httpMetadata', 'customMetadata']) {
-    const view = {
-      key: rec.key,
-      size: rec.size,
-      etag: rec.etag,
-      httpEtag: rec.httpEtag,
-      uploaded: rec.uploaded,
-      range,
-      writeHttpMetadata(headers) {
-        const md = rec.httpMetadata || {};
-        if (md.contentType) headers.set('Content-Type', md.contentType);
-        if (md.contentDisposition) headers.set('Content-Disposition', md.contentDisposition);
-        if (md.contentLanguage) headers.set('Content-Language', md.contentLanguage);
-        if (md.cacheControl) headers.set('Cache-Control', md.cacheControl);
-      },
-    };
-    if (include.includes('httpMetadata')) view.httpMetadata = rec.httpMetadata;
-    if (include.includes('customMetadata')) view.customMetadata = rec.customMetadata;
-    if (withBody) {
-      const part = range ? rec.bytes.subarray(range.offset, range.offset + range.length) : rec.bytes;
-      view.body = new Response(part).body;
-      view.arrayBuffer = async () => part.slice().buffer;
-      view.text = async () => new TextDecoder().decode(part);
-      view.json = async () => JSON.parse(new TextDecoder().decode(part));
-    }
-    return view;
   }
 }
 
@@ -300,8 +248,7 @@ const env = {
   ADMIN_USER: flag('admin-user', vars.ADMIN_USER || 'admin'),
   ADMIN_PASSWORD: flag('admin-pass', vars.ADMIN_PASSWORD || 'dev-admin'),
   UPLOAD_TOKEN: flag('token', vars.UPLOAD_TOKEN || 'dev-token'),
-  STORES: [{ binding: 'R2_MAIN', from: 0 }],
-  R2_MAIN: new Bucket(),
+  META: new KV(),
   LOGIN_LIMITER: limiter,
   ASSETS: { fetch: assets },
 };
@@ -363,7 +310,7 @@ server.listen(PORT, () => {
   console.log(
     hfEnabled
       ? `  HF 假网关：${env.HF_NAMESPACE}/${env.HF_BUCKET} → ${env.HF_ENDPOINT}（存储页可试「实验：仅 HuggingFace」）`
-      : '  HF / Telegram 未配置：相关卡片隐藏（只存 R2）',
+      : '  HF / Telegram 未配置：相关卡片隐藏，无法传图（本地要传图请带 --hf）',
   );
   if (vendorMissing) console.log('  提示：public/vendor 不存在 → 浏览器端压缩会不可用（上传仍可用，原图直传）');
   console.log('  数据在内存里：Ctrl+C 停止后上传的图片会清空');

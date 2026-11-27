@@ -1,14 +1,16 @@
-// HuggingFace 归档：用 HF Storage Buckets（S3 兼容对象存储）给图片做第三份拷贝，与 Telegram 备份平级。
-// 设计见 docs/Huggingface-集成方案.md；只当备份盘，不做主存：bucket 里的对象必须带签名才能读，
-// 公开外链与边缘缓存都得靠 Worker 代读，所以它排在读路径末端（Cache API → R2 → Telegram 备份 → 这里）。
+// HuggingFace 存储：用 HF Storage Buckets（S3 兼容对象存储）存图片字节，与 Telegram 平级的「字节后端」。
+// 设计见 docs/Huggingface-集成方案.md。在新存储模型里（R2 已移除，见 docs/重构方案-移除R2.md）HF 既可当
+//   hf      主存（字节只进 bucket，读必须 Worker 代读，实验档）
+//   tg+hf   TG 主存时的归档备份盘
+// bucket 里的对象必须带签名才能读，公开外链与边缘缓存都得靠 Worker 代读。
 //
 // 为什么选 bucket（路线 B）而不是私有 git 仓库（路线 A）：
 //   路线 A 每次写都是一次 commit，而且删指针不释放 LFS 空间（要联系官方清理，最长 36 h）——
-//   图床会反复增删，归档盘只涨不消不能接受。路线 B 语义就是"小号 R2"：删除立即回收、支持 ListObjects。
+//   图床会反复增删，归档盘只涨不消不能接受。路线 B 语义就是"小号对象存储"：删除立即回收、支持 ListObjects。
 //   代价是认证走 AWS SigV4 而不是一个 Bearer 头：本文件用 WebCrypto 手写签名，src/ 仍零依赖。
 //
-// 清单照旧写在主桶（.hf/<key>）：HF bucket 明确不存 x-amz-meta-*（官方文档），customMetadata 无处安放；
-// 好处是读回时 Content-Type / Content-Disposition 直接从 R2 侧车对象还原，与 .tg/<key> 同构。
+// 清单（manifest）不再写 HF/R2 侧车，改存 KV（见 meta.js）：HF bucket 明确不存 x-amz-meta-*（官方文档），
+// customMetadata 无处安放，所以 Content-Type / Content-Disposition 一并记进 KV 清单，读回时还原。
 //
 // 桶的硬事实（docs/Huggingface-集成方案.md §3 已查证）：
 //   · 只认 path-style：https://<namespace>.s3.hf.co/<bucket>/<key>；区域固定 us-east-1；
@@ -34,8 +36,6 @@ const ALGORITHM = 'AWS4-HMAC-SHA256';
 const UNSIGNED = 'UNSIGNED-PAYLOAD'; // 流式 PUT 的载荷哈希：整份读进内存算哈希不划算
 const EMPTY_SHA = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'; // 空正文的 SHA-256
 
-export const SIDECAR = '.hf/'; // 备份清单（连同原对象 httpMetadata）写在主桶
-export const QUEUE = '.hfq/'; // 太大 / 这次没备份成的待处理标记
 export const MAX_HF_BYTES = 30 * 1024 * 1024; // 熔断，不是魔法数：内存 128 MB 与 waitUntil 30 s 双重约束
 export const BACKUP_BATCH = 20; // 单次 /api/hf/backup 的文件数（每张 ≈2 次外呼）
 export const HF_QUOTA = 100 * 1024 ** 3; // 免费档私有存储 100 GB，用来算配额百分比
@@ -47,8 +47,6 @@ const HF_TIMEOUT = 25 * 1000; // 单次外呼超时：给 waitUntil 的 30 秒�
 export const hfReady = (env) =>
   Boolean(env.HF_S3_ACCESS_KEY && env.HF_S3_SECRET && env.HF_BUCKET && (env.HF_NAMESPACE || env.HF_ENDPOINT));
 
-// 实验主存 'hf' 的占位对象标记：R2 里只留清单 + 缩略图，字节只在 bucket
-export const isHfStub = (obj) => obj?.customMetadata?.stub === 'hf';
 
 export class HfError extends Error {
   constructor(message, status, retryAfter) {

@@ -1,4 +1,4 @@
-// 设置页（管理员）：站点名称、防盗链与 RSS 阅读器放行、放行网站、链接域名、存储（R2 / Telegram / HuggingFace）、主题与深浅色、登录页/上传页背景、页脚友情链接。
+// 设置页（管理员）：站点名称、防盗链与 RSS 阅读器放行、放行网站、链接域名、存储（Telegram / HuggingFace）、主题与深浅色、登录页/上传页背景、页脚友情链接。
 // 每项改动立即保存（POST /api/settings），服务端负责规范化与校验
 import { t } from './i18n.js';
 import { $, api, errText, gate, icon, initLang, logout, setDomains, setShape, setSite, size, snack, topbarShadow } from './ui.js';
@@ -290,17 +290,13 @@ for (const row of document.querySelectorAll('[data-theme-flag]')) {
   row.onclick = () => save({ theme: { [f]: !settings.theme[f] } }, $('.toggle', row));
 }
 
-// ---------- 存储：R2 / Telegram / HuggingFace 的组合。枚举的第一段是主存，其余是备份盘 ----------
+// ---------- 存储：图片字节存到哪个后端。默认 tg，设置页可切换 ----------
 const MODES = [
-  ['r2', 'modeR2', 'hint_r2'],
-  ['r2+tg', 'modeBackup', 'hint_r2tg'],
   ['tg', 'modeTg', 'hint_tg'],
-  ['r2+hf', 'modeR2Hf', 'hint_r2hf'],
   ['tg+hf', 'modeTgHf', 'hint_tghf'],
-  ['r2+tg+hf', 'modeAll', 'hint_all'],
   ['hf', 'modeHfOnly', 'hint_hf'], // 实验值：字节只进 bucket，读必须 Worker 代读
 ];
-// 某一段能不能用：tg 要 bot 密钥，hf 要 S3 密钥；r2 永远可用
+// 某一段能不能用：tg 要 bot 密钥，hf 要 S3 密钥
 const ready = (token) => (token === 'tg' ? settings.tgReady : token === 'hf' ? settings.hfReady : true);
 const modeReady = (m) => m.split('+').every(ready);
 

@@ -1,4 +1,4 @@
-// 缩略图：浏览器生成 WebP（短边 400），存到 R2 的 .thumb/<key>，经 /api/thumb/<key> 读取（要登录）。
+// 缩略图：浏览器生成 WebP（短边 400），经 /api/thumb/<key> 写进 KV（要登录）。
 // 上传页在上传后生成；管理页可给旧文件补。原图一个字节都不动
 const SHORT = 400;
 let worker;

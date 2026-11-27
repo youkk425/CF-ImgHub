@@ -309,7 +309,7 @@ function openDetail(o) {
   $('[data-f=type]', dlg).textContent = o.contentType || '—';
   $('[data-f=size]', dlg).textContent = `${size(o.size)} (${o.size.toLocaleString()} B)`;
   $('[data-f=uploaded]', dlg).textContent = when(timeOf(o));
-  $('[data-f=store]', dlg).textContent = o.tg ? 'Telegram' : o.hf ? 'HuggingFace' : archived.has(o.key) ? 'R2 + HF' : 'R2';
+  $('[data-f=store]', dlg).textContent = o.tg && o.hf ? 'Telegram + HuggingFace' : o.tg ? 'Telegram' : 'HuggingFace';
   $('[data-f=key]', dlg).textContent = o.key;
   $('[data-f=name]', dlg).textContent = o.name || '';
   for (const el of dlg.querySelectorAll('.orig')) el.hidden = !o.name;

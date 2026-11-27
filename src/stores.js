@@ -1,9 +1,13 @@
-// 存储路由：按 key 里的上传时间决定在哪个桶，读路径不查数据库。
-// 两种 key 都带时间：
-//   保持原名  <13 位毫秒时间戳>_<文件名>          （旧图床的链接也是这个格式）
-//   规范命名  ImgHub-<YYYYMMDD>-<HHmmss>-<随机>.<扩展名>   （时间是 UTC+8）
-// 目前只有 R2 绑定（同账户）；第二个账户的桶（S3 API）以后在这里加类型。
-// Telegram 不在路由表里：只存 Telegram 的文件在 R2 留一个占位对象，见 telegram.js。
+// 存储路由：R2 移除后，"桶"的概念退化成两个正交的后端——
+//   字节后端：图片字节放哪（HF bucket 或 Telegram 频道），由设置里的 storage 模式决定。
+//   元数据后端：清单 / 设置 / 缩略图 / gone / 队列，统一走 KV（见 meta.js），与字节后端无关。
+// 原先"按 key 里的时间戳在多个 R2 桶间路由 + 主桶兜底"的逻辑整体删除：现在只有一个字节后端（可选一份备份），
+// 不再需要多桶时间路由，也不再有"主桶"这个承载元数据的角色（元数据全在 KV）。
+//
+// key 仍带上传时间（保留原名 <13位毫秒>_<文件名> / 规范命名 ImgHub-YYYYMMDD-HHmmss-<随机>），
+// 但时间戳现在只用于命名冲突检查和撤销窗口，不再参与桶路由。
+
+import { getManifest } from './meta.js';
 
 export const BRAND = 'ImgHub';
 const STD_KEY = new RegExp(`^${BRAND}-(\\d{4})(\\d{2})(\\d{2})-(\\d{2})(\\d{2})(\\d{2})-`);
@@ -18,38 +22,14 @@ export function keyTime(key) {
   return Date.UTC(y, mo - 1, d, h - 8, mi, s);
 }
 
-function table(env) {
-  const list = Array.isArray(env.STORES) && env.STORES.length ? env.STORES : [{ binding: 'R2_MAIN', from: 0 }];
-  return list
-    .map((s) => ({ ...s, bucket: env[s.binding] }))
-    .filter((s) => s.bucket)
-    .sort((a, b) => a.from - b.from);
-}
-
-// 读：先查时间所属的桶，其余桶依次兜底（防止路由表改动或手动搬移造成漏查）
-export function storesFor(env, key) {
-  const list = table(env);
-  const ts = keyTime(key);
-  if (!Number.isFinite(ts) || list.length < 2) return list;
-  let i = list.length - 1;
-  while (i > 0 && list[i].from > ts) i--;
-  return [list[i], ...list.filter((_, j) => j !== i)];
-}
-
-// 写：路由表最后一项（当前桶）
-export function writeStore(env) {
-  const list = table(env);
-  if (!list.length) throw new Error('no storage configured');
-  return list[list.length - 1];
-}
-
-// 设置对象放在路由表第一项（主桶），以后追加新桶也不会搬家
-export function configStore(env) {
-  const list = table(env);
-  if (!list.length) throw new Error('no storage configured');
-  return list[0];
-}
-
-export function allStores(env) {
-  return table(env);
+// 解析 storage 模式 → { primary, backup }。primary: 'tg' | 'hf'。
+//   'tg'      → { primary:'tg', backup:null }
+//   'tg+hf'   → { primary:'tg', backup:'hf' }
+//   'hf'      → { primary:'hf', backup:null }
+// 默认 tg：不绑卡也能跑（HF 主存是实验档，读限 16 次/秒、单文件 30 MiB，故不作默认）。
+// 没配对应密钥时上游 api.js 的 storagePlan 会把不可用的那一段去掉、并降级到可用后端。
+export function splitStorage(mode) {
+  const [primary = 'tg', ...rest] = String(mode || 'tg').split('+');
+  const backup = rest.includes('hf') ? 'hf' : null;
+  return { primary: primary === 'hf' ? 'hf' : 'tg', backup };
 }

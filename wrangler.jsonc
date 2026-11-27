@@ -12,8 +12,11 @@
     "run_worker_first": ["/file/*", "/api/*"]
   },
 
-  "r2_buckets": [
-    { "binding": "R2_MAIN", "bucket_name": "cf-imghub" }
+  // 元数据（设置 / 图片清单 / 缩略图 / 已删除名单 / HF 待归档队列）存 Workers KV。
+  // R2 已移除：图片字节只走 Telegram / HuggingFace，KV 只放小元数据，免费额度绰绰有余。
+  // 首次部署前要建命名空间并填 id：npx wrangler kv namespace create META
+  "kv_namespaces": [
+    { "binding": "META", "id": "{{KV_NAMESPACE_ID_ybq0xj}}" }
   ],
 
   // 登录限速：每个 IP 每分钟 5 次（按机房计数，足以挡住暴力猜密码）
@@ -21,21 +24,15 @@
     { "name": "LOGIN_LIMITER", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 } }
   ],
 
-  // 补备份：每 6 小时扫一遍 .hfq/（HuggingFace 归档的失败/超限队列）。
+  // 补归档：每 6 小时扫一遍 KV 里的 HF 待归档队列（归档失败/超限的 key）。
   // 没配 HF 密钥时 scheduled 里直接返回，不产生任何外呼与费用。
   "triggers": { "crons": ["0 */6 * * *"] },
 
   // 部署时保留面板里手动设的变量。以下可选变量不写在这里、只在面板设置，
   // 免得每次部署被覆盖、也免得一键部署的用户继承本站的值：
-  //   LEGACY_ORIGIN  R2 找不到时回源的旧图床地址（取回后写入 R2）；不设则关闭
+  //   LEGACY_ORIGIN  清单里查不到时回源的旧图床地址（取回后写进当前后端 + KV 清单）；不设则关闭
   //   LEGACY_BEFORE  只有早于此毫秒时间戳的「时间戳_文件名」key 才回源；不设 = 不限
-  "keep_vars": true,
-
-  "vars": {
-    // 存储路由表：按 key 开头的 13 位毫秒时间戳选桶，from 为起始时间戳（含）。
-    // 新上传写入最后一项。日后接第二个账户时在末尾追加一项即可。
-    "STORES": [{ "binding": "R2_MAIN", "from": 0 }]
-  }
+  "keep_vars": true
   // 密钥（wrangler secret put <名称>；本地写在 .dev.vars）：
   //   SESSION_SECRET   会话签名密钥，随机长字符串；轮换即让所有人重新登录
   //   UPLOAD_PASSWORD  上传页密码

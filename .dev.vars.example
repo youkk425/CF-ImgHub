@@ -4,11 +4,11 @@ ADMIN_USER=admin
 ADMIN_PASSWORD=change-me
 UPLOAD_TOKEN=change-me
 
-# 可选：Telegram 存储（三项都不设就只存 R2）。设好后在 /settings 的「存储」里选模式。
+# 可选：Telegram 存储（默认存储后端；TG_BOT_TOKEN + TG_CHAT_ID 配齐才启用）。
 # TG_BOT_TOKEN=123456789:AA...
 # TG_CHAT_ID=-1001234567890
 
-# 可选：HuggingFace 归档（备份盘，与 Telegram 平级；AK/SK 两项 + 桶名 + namespace 配齐才生效）。
+# 可选：HuggingFace 存储（tg+hf 归档备份或 hf 主存；AK/SK 两项 + 桶名 + namespace 配齐才生效）。
 # 在 HF「Access Tokens」页对一个 write 级 token 点「Generate S3 credentials」拿到 AK/SK：
 # HF_S3_ACCESS_KEY=HFAK...
 # HF_S3_SECRET=hf_...

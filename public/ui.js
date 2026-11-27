@@ -646,7 +646,7 @@ export async function footer() {
 }
 
 // ---------- 杂项 ----------
-// 上传时间：两种 key 都带时间（规范名是 UTC+8 的钟面），解析不出就用 R2 的上传时间
+// 上传时间：两种 key 都带时间（规范名是 UTC+8 的钟面），解析不出就用清单里的 uploaded（从 key 时间戳还原）
 export function timeOf(o) {
   const ts = /^(\d{13})_/.exec(o.key)?.[1];
   if (ts) return Number(ts);

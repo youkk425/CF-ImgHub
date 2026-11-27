@@ -1,24 +1,19 @@
 // Telegram 存储：用 Bot API 把文件以 document 发到频道（不压缩、不转码），按 file_id 取回。
-// 两种用法（设置里的 storage）：
-//   r2+tg  R2 照常存，另在 Telegram 存一份备份；清单写在主桶 .tg/<key>（读路径 R2 找不到时才用）
-//   tg     只存 Telegram；R2 里同名 key 是一个小「占位对象」：正文是清单 JSON，
-//          httpMetadata 照常（Content-Type 等），customMetadata {tg:'1', size:'<真实大小>'}
+// 在新的存储模型里（R2 已移除，见 docs/重构方案-移除R2.md）Telegram 是一个纯「字节后端」：
+//   tg      字节只存 Telegram
+//   tg+hf   字节存 Telegram（主），另归档一份到 HuggingFace
+// 本模块只负责把字节发进频道 / 按 manifest 取回 / 删消息；清单（manifest）由调用方写进 KV，
+// 不再像旧方案那样在 R2 里留「占位对象」——R2 没了，占位对象、customMetadata、侧车全套概念一并删除。
 // 清单 {v, size, chunks:[{id, size, msg}]}：getFile 只能下载 20MB 以内的文件，所以按 CHUNK 分片，
-// 每片一条消息（caption 写 key 与片号，万一 R2 丢了也能人工对上）。
+// 每片一条消息（caption 写 key 与片号，万一频道出事也能人工对上）。
 // 上传与下载都是流式的：上传自己拼 multipart（FixedLengthStream 定长），不把整个文件读进内存。
 // 密钥：TG_BOT_TOKEN（@BotFather 给的 token）、TG_CHAT_ID（频道 id，如 -100…；bot 要是频道管理员，能发消息、删消息）
 
 const API = 'https://api.telegram.org';
 export const CHUNK = 19 * 1024 * 1024;
-export const SIDECAR = '.tg/';
 const PATH_TTL = 50 * 60 * 1000; // getFile 给的下载路径至少有效 1 小时
 
 export const tgReady = (env) => Boolean(env.TG_BOT_TOKEN && env.TG_CHAT_ID);
-// 占位对象：正文是清单，真实字节在别处（Telegram 频道 / HuggingFace bucket），真实大小记在 customMetadata.size。
-// tg:'1' 是老标记（保留兼容），stub:'tg'|'hf' 是新标记——两种主存模式共存时读路径靠它分流。
-export const isStub = (obj) => obj?.customMetadata?.tg === '1' || obj?.customMetadata?.stub === 'tg';
-export const isPlaceholder = (obj) => isStub(obj) || Boolean(obj?.customMetadata?.stub);
-export const realSize = (obj) => (isPlaceholder(obj) ? Number(obj.customMetadata.size) || 0 : obj.size);
 
 export class TgError extends Error {
   constructor(message, retryAfter) {

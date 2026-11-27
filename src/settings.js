@@ -1,12 +1,14 @@
-// 运行时设置（后台可改）：存成主桶里的一个 JSON 对象，读路径在 isolate 内存里缓存 30 秒。
-// 放 R2 而不是 KV / vars：不用多建资源，改了不用重新部署；读路径每个 isolate 每 30 秒最多读一次。
+// 运行时设置（后台可改）：存成 KV（env.META）里的一个 JSON 值，读路径在 isolate 内存里缓存 30 秒。
+// 放 KV：R2 移除后元数据的载体（免绑卡、Workers 原生、改了不用重新部署）；读路径每个 isolate 每 30 秒最多读一次。
 //
 // 防盗链语义：hotlink=true 时全局开启；allow 是后台填的放行网站（含子域）；exempt 里的 key 单独放行（单张开关）。
 // domains：本图床绑定的其他域名（只认完整主机名）。上传页/管理页可选用哪个域名生成链接，防盗链也把它们当作自身。
 // rss：是否放行内建的网页版 RSS 阅读器名单（默认开）。
-// storage：新上传存到哪里。第一段是主存（r2 | tg），其余是备份盘（tg | hf），例如 'r2+tg+hf'。
-//   可选值见 STORAGE_MODES；没配 TG_BOT_TOKEN/TG_CHAT_ID 或 HF_* 密钥时，未就绪的那一段会被自动去掉（见 api.js 的 storagePlan）。
-//   只存 HF（primary=hf）暂不提供：bucket 不存 customMetadata、不支持条件请求，而设置与缩略图离不开 R2。
+// storage：新上传的字节存到哪个后端。三种模式（默认 tg，设置页可切换）：
+//   tg      只存 Telegram（不占对象存储，HF 不启用）
+//   tg+hf   Telegram 主存，另归档一份到 HuggingFace（容灾）
+//   hf      只存 HuggingFace（实验档：Worker 代读、读限约 16 次/秒、单文件 30 MiB）
+//   没配 TG_BOT_TOKEN/TG_CHAT_ID 或 HF_* 密钥时，未就绪的后端会被自动降级（见 api.js 的 storagePlan）。
 // bg：登录页 / 上传页背景，urls 是图片地址（https 完整地址或本站 /file/… 路径，最多 5 个，多于 1 个时轮播），interval 为轮播秒数。
 // 旧版存的是 keys（本图床的 key），读取时自动转成 /file/<key>。
 // theme：{color, mode, logo, glow}。glow：各页（含登录页）的撞色渐层背景，默认 true。logo=true 时 Logo 与站名改用主题色（默认 false = 枫橙 Logo）。color 是预设名（见 THEME_COLORS，配色在前端 theme.js 生成）或 #rrggbb 自定义种子色；
@@ -18,9 +20,10 @@
 // 保留 GONE_TTL（略长于缓存一年），最多 MAX_GONE 条；不对外公开。
 // 单张设置不写进对象的 customMetadata，因为图片回应会在 Cache API 里缓存一年，
 // 改了 metadata 也清不掉其他机房的缓存；放在设置里则所有机房 30 秒内生效。
-import { configStore } from './stores.js';
+import { getRawSettings, putRawSettings } from './meta.js';
+import { splitStorage } from './stores.js';
 
-export const SETTINGS_KEY = '.imghub/settings.json';
+const SETTINGS_KEY = 'settings'; // KV key（原 .imghub/settings.json 对象）
 const TTL = 30 * 1000;
 // 没有设置对象时：防盗链关闭，放行名单预置三项（本站两个博客 + 示例域名，部署者在管理页改成自己的）
 const DEFAULTS = {
@@ -32,20 +35,15 @@ const DEFAULTS = {
   domains: [],
   bg: { urls: [], login: true, upload: true, interval: 10 },
   links: [],
-  storage: 'r2',
+  storage: 'tg',
   theme: { color: 'maple', mode: 'auto', logo: false, glow: true },
 };
 export const THEME_COLORS = ['maple', 'sakura', 'amber', 'bamboo', 'teal', 'ocean', 'violet', 'ink'];
 export const THEME_MODES = ['auto', 'light', 'dark'];
 export const normThemeColor = (c) => (THEME_COLORS.includes(c) ? c : typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c) ? c.toLowerCase() : null);
-// 主存在前、备份盘在后；'hf' 是实验主存（字节只进 bucket，R2 只留清单/缩略图），默认不选
-export const STORAGE_MODES = ['r2', 'r2+tg', 'tg', 'r2+hf', 'tg+hf', 'r2+tg+hf', 'hf'];
-
-// 'r2+tg+hf' → { primary: 'r2', backups: ['tg', 'hf'] }；单写 'tg' 时主存就是 tg、没有备份盘
-export function splitStorage(mode) {
-  const [primary = 'r2', ...backups] = String(mode || 'r2').split('+');
-  return { primary, backups };
-}
+// 三种字节后端模式，默认 tg（免绑卡即可跑）；hf 是实验档（读限约 16 次/秒、单文件 30 MiB），不作默认
+export const STORAGE_MODES = ['tg', 'tg+hf', 'hf'];
+export { splitStorage }; // 'r2+tg+hf' → { primary:'tg', backup:null }；'tg+hf' → { primary:'tg', backup:'hf' }；'hf' → { primary:'hf', backup:null }
 export const MAX_SITES = 200;
 export const MAX_DOMAINS = 20;
 export const MAX_BG = 5;
@@ -63,8 +61,8 @@ export async function getSettings(env, { fresh = false } = {}) {
   if (!fresh && memo && Date.now() - memoAt < TTL) return memo;
   let data = {};
   try {
-    const obj = await configStore(env).bucket.get(SETTINGS_KEY);
-    if (obj) data = await obj.json();
+    const raw = await getRawSettings(env);
+    if (raw) data = raw;
   } catch (err) {
     console.warn('settings read failed', err.message);
     if (memo) return memo; // 读失败时沿用旧值，别因此放开防盗链
@@ -76,9 +74,7 @@ export async function getSettings(env, { fresh = false } = {}) {
 
 export async function saveSettings(env, next) {
   const data = normalize(next);
-  await configStore(env).bucket.put(SETTINGS_KEY, JSON.stringify(data), {
-    httpMetadata: { contentType: 'application/json' },
-  });
+  await putRawSettings(env, data);
   memo = withSets(data);
   memoAt = Date.now();
   return data;
