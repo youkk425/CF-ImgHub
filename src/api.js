@@ -312,14 +312,14 @@ async function list(env, url) {
   const prefix = url.searchParams.get('prefix') || '';
   const { items, cursor } = await listManifests(env, { prefix, cursor: url.searchParams.get('cursor') || undefined, limit });
   return json({
-    items: items.map(({ key, m }) => ({
+    items: items.map(({ key, manifest }) => ({
       key,
-      name: m.name,
+      name: manifest.name,
       url: `${url.origin}/file/${encodeURIComponent(key)}`,
-      size: m.size,
-      tg: m.loc === 'tg' || Boolean(m.tg) || undefined,
-      hf: m.loc === 'hf' || Boolean(m.hf) || undefined,
-      contentType: m.httpMetadata?.contentType,
+      size: manifest.size,
+      tg: manifest.loc === 'tg' || Boolean(manifest.tg) || undefined,
+      hf: manifest.loc === 'hf' || Boolean(manifest.hf) || undefined,
+      contentType: manifest.httpMetadata?.contentType,
       // KV 清单没有 R2 的 uploaded 时间；从 key 里的时间戳还原（规范名与时间戳名都带）
       uploaded: keyTime(key) || undefined,
     })),
@@ -335,9 +335,9 @@ async function stats(env) {
   let pages = 0;
   do {
     const { items, cursor: next } = await listManifests(env, { cursor, limit: 1000 });
-    for (const { m } of items) {
+    for (const { manifest } of items) {
       count++;
-      bytes += m.size || 0;
+      bytes += manifest.size || 0;
     }
     cursor = next;
   } while (cursor && ++pages < 20);
@@ -437,14 +437,14 @@ async function hfStatus(env) {
   let tgOnly = 0;
   let hfOnly = 0;
   const pending = [];
-  for (const { m } of manifests) {
-    if (m.hf) backed++;
-    else if (m.loc === 'hf') hfOnly++;
-    if (m.loc === 'tg' && !m.hf) tgOnly++;
+  for (const { manifest } of manifests) {
+    if (manifest.hf) backed++;
+    else if (manifest.loc === 'hf') hfOnly++;
+    if (manifest.loc === 'tg' && !manifest.hf) tgOnly++;
   }
   const queuedKeys = new Set(await listHfQueue(env));
-  for (const { key, m } of manifests) {
-    if (queuedKeys.has(key) || (m.loc === 'tg' && !m.hf)) {
+  for (const { key, manifest } of manifests) {
+    if (queuedKeys.has(key) || (manifest.loc === 'tg' && !manifest.hf)) {
       if (pending.length < 200) pending.push(key);
     }
   }
@@ -480,10 +480,10 @@ async function tgStatus(env) {
   let backed = 0;
   let hfOnly = 0;
   const pending = [];
-  for (const { key, m } of manifests) {
-    if (m.tg) backed++;
-    else if (m.loc === 'hf') hfOnly++;
-    if (m.loc === 'hf' && !m.tg && pending.length < 200) pending.push(key);
+  for (const { key, manifest } of manifests) {
+    if (manifest.tg) backed++;
+    else if (manifest.loc === 'hf') hfOnly++;
+    if (manifest.loc === 'hf' && !manifest.tg && pending.length < 200) pending.push(key);
   }
   return json({ ready: tgReady(env), storage: (await getSettings(env)).storage, backed, hfOnly, pending });
 }

@@ -96,7 +96,9 @@ export async function listHfQueue(env, limit = 1000) {
 // 真到上万张再考虑维护独立索引 key。返回 [{key, manifest}]，按 key 字典序（即上传时间序）。
 export async function listManifests(env, { prefix = '', cursor, limit = 100 } = {}) {
   const want = MANIFEST_PREFIX + (prefix || '');
-  const page = await ns(env).list({ prefix: want, limit, cursor });
+  // KV list 单页上限 1000，超过会报错：这里 clamp 住，避免调用方传大值把接口打挂
+  const pageLimit = Math.min(Math.max(1, Number(limit) || 100), 1000);
+  const page = await ns(env).list({ prefix: want, limit: pageLimit, cursor });
   const items = [];
   for (const k of page.keys) {
     const key = k.name.slice(MANIFEST_PREFIX.length);
